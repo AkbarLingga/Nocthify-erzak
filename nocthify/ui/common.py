@@ -56,22 +56,38 @@ class GlassPopup(QWidget):
     def paint_content(self, p):
         pass
 
-    def popup_at(self, pos: QPoint):
+    def popup_at(self, pos: QPoint, rise: QPoint = None):
+        """Show at pos. rise = offset the panel slides in from (e.g. QPoint(0, 40) = up from the dock)."""
         self._blur_on = bool(self.hub.config.get("general", "real_blur"))
-        self.move(pos)
+        animate = bool(self.hub.config.get("general", "animations"))
+        start = pos + rise if (rise is not None and animate) else pos
+        self.move(start)
         self.setWindowOpacity(0.0)
         self.show()
         self.raise_()
         self.activateWindow()
+        if not IS_LINUX:
+            # opened from a keyboard hook / tray: make sure we really get the keyboard focus
+            try:
+                self.hub.backend.activate(int(self.winId()))
+            except Exception:
+                pass
         if self._blur_on:
             self.hub.backend.apply_blur(self, self.RADIUS, True, self.pal.dark)
-        if self.hub.config.get("general", "animations"):
+        if animate:
             self._anim = QPropertyAnimation(self, b"windowOpacity", self)
-            self._anim.setDuration(160)
+            self._anim.setDuration(170)
             self._anim.setStartValue(0.0)
             self._anim.setEndValue(1.0)
             self._anim.setEasingCurve(QEasingCurve.OutCubic)
             self._anim.start()
+            if start != pos:
+                self._anim_pos = QPropertyAnimation(self, b"pos", self)
+                self._anim_pos.setDuration(260)
+                self._anim_pos.setStartValue(start)
+                self._anim_pos.setEndValue(pos)
+                self._anim_pos.setEasingCurve(QEasingCurve.OutCubic)
+                self._anim_pos.start()
         else:
             self.setWindowOpacity(1.0)
 

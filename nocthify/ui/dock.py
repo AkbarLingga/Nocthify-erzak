@@ -15,12 +15,12 @@ import os
 import sys
 import time
 
-from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer
-from PyQt5.QtGui import QColor, QFont, QLinearGradient, QPainter, QRegion
+from PyQt5.QtCore import QDate, QLocale, QPoint, QPointF, QRectF, Qt, QTimer
+from PyQt5.QtGui import QColor, QFont, QFontMetricsF, QLinearGradient, QPainter, QRegion
 from PyQt5.QtWidgets import QApplication, QMenu, QWidget
 
 from .. import icons
-from ..theme import elide, font, menu_stylesheet, paint_glass, rounded_path
+from ..theme import elide, font, menu_stylesheet, paint_battery, paint_glass, rounded_path
 
 IS_LINUX = not sys.platform.startswith("win")
 
@@ -54,6 +54,16 @@ class Dock(QWidget):
         self.items = []
         self.running_order = []
         self.mouse = None            # QPointF while the cursor is over the dock
+        self.mag_at = None           # last cursor point: magnification relaxes around it after leaving
+        self.tray_hover = None       # hovered part of the status area
+        self._genie = None
+        self._snaps = {}             # wid -> (QImage, QRectF) snapshot used for the restore genie
+        self._vol_popup = None
+        self._cal_popup = None
+        self._tray_popup = None
+        self._scaled = {}            # (icon key, px) -> icon pre-scaled with a high-quality filter
+        self._has_battery = None
+        self._clock = QTimer(self, singleShot=True, timeout=self._clock_tick)
         self.hover = 0.0             # 0..1 magnification blend
         self.hover_target = 0.0
         self.hidden_amt = 0.0        # 0 = visible, 1 = tucked away (autohide)
@@ -68,7 +78,11 @@ class Dock(QWidget):
         hub.windows_changed.connect(self._on_windows)
         hub.theme_changed.connect(self.update)
         hub.fullscreen_changed.connect(self._on_fullscreen)
+        hub.volume_changed.connect(self._tray_changed)
+        hub.network_changed.connect(self._tray_changed)
+        hub.battery_changed.connect(self._on_battery)
         self.reload()
+        self._clock_tick()
 
     # ------------------------------------------------------------- config
     @property
@@ -91,6 +105,7 @@ class Dock(QWidget):
         self.autohide = bool(c.get("autohide", False))
         self.hidden_amt = self.hidden_target = 1.0 if self.autohide else 0.0
         self._icons.clear()
+        self._scaled.clear()
         self._rebuild()
         if c.get("enabled", True) and not self.hub.fullscreen:
             self.show()
@@ -146,15 +161,240 @@ class Dock(QWidget):
             if not any(i.kind == "sep" for i in items):
                 items.append(old.get(("sep", "")) or Item("sep"))
             items.append(old.get(("trash", "")) or Item("trash", name="Trash"))
+        if c.get("show_tray", True):
+            items.append(old.get(("sep", "tray")) or Item("sep", "tray"))
+            items.append(old.get(("tray", "")) or Item("tray", name="Status"))
         self.items = items
         for k in [k for k, v in self._icons.items() if v is None]:
             del self._icons[k]
         self._resize()
         self.update()
 
-    def _on_windows(self, _wins):
+    def _on_windows(self, wins):
+        # a snapshot is only valid while its window stays minimised the way we left it
+        minimized = {w.id for w in wins if w.minimized}
+        for wid in [w for w in self._snaps if w not in minimized]:
+            del self._snaps[wid]
         if self.drag is None:
             self._rebuild()
+
+    # ------------------------------------------------------- status area
+    def _tray_changed(self, *_a):
+        if self.c.get("show_tray", True):
+            self.update()
+
+    def _on_battery(self, b):
+        has = b is not None
+        if has != self._has_battery:
+            self._has_battery = has
+            self._rebuild()
+        else:
+            self._tray_changed()
+
+    def _clock_tick(self):
+        self._tray_changed()
+        now = time.localtime()
+        self._clock.start(int((60 - now.tm_sec) * 1000 + 50))
+
+    def _clock_texts(self):
+        if self.cfg.get("general", "clock_24h"):
+            t = time.strftime("%H:%M")
+        else:
+            t = time.strftime("%I:%M %p").lstrip("0")
+        d = QLocale.system().toString(QDate.currentDate(), QLocale.ShortFormat)
+        return t, d
+
+    def _tray_fonts(self):
+        b = self.base
+        return font(max(11.0, b * 0.27), QFont.DemiBold), font(max(9.5, b * 0.215))
+
+    def _tray_parts(self):
+        """[(key, length along the dock)] for the status area."""
+        b = self.base
+        horiz = self.pos_kind == "bottom"
+        parts = []
+        if self.hub.backend.name == "windows" and self.cfg.get("taskbar", "mode") == "hide":
+            parts.append(("chev", b * 0.5))
+        parts.append(("net", b * 0.66))
+        parts.append(("vol", b * 0.66))
+        if self.hub.battery is not None:
+            parts.append(("bat", b * 1.3 if horiz else b * 0.86))
+        if horiz:
+            f1, f2 = self._tray_fonts()
+            sample_t = "23:59" if self.cfg.get("general", "clock_24h") else "12:59 PM"
+            sample_d = QLocale.system().toString(QDate(2026, 12, 28), QLocale.ShortFormat)
+            w = max(QFontMetricsF(f1).horizontalAdvance(sample_t), QFontMetricsF(f2).horizontalAdvance(sample_d))
+            parts.append(("clock", w + b * 0.4))
+        else:
+            parts.append(("clock", b * 1.0))
+        return parts
+
+    def _tray_len(self):
+        return sum(length for _k, length in self._tray_parts())
+
+    def _tray_part_at(self, pt):
+        lay, _a, _b = self.layout()
+        m = self._main(pt)
+        for it, x, _s in lay:
+            if it.kind == "tray":
+                pos = x
+                for key, length in self._tray_parts():
+                    if pos <= m < pos + length:
+                        return key, pos, length
+                    pos += length
+        return None
+
+    def _tray_tip(self, key):
+        h = self.hub
+        if key == "chev":
+            return "Show hidden icons"
+        if key == "net":
+            kind, name = h.network or ("none", "")
+            return f"Wi-Fi  ·  {name}" if kind == "wifi" else "Ethernet" if kind == "ethernet" else "Not connected"
+        if key == "vol":
+            v = h.volume
+            return "Volume" if not v else ("Muted" if v[1] else f"Volume  ·  {v[0]}%")
+        if key == "bat" and h.battery:
+            pct, plugged = h.battery
+            return f"Battery  ·  {pct}%" + ("  ·  charging" if plugged else "")
+        if key == "clock":
+            return QLocale.system().toString(QDate.currentDate(), "dddd, d MMMM yyyy")
+        return ""
+
+    def _tray_click(self, pt):
+        hit = self._tray_part_at(pt)
+        if hit is None:
+            return
+        key, pos, length = hit
+        center = self.mapToGlobal(QPoint(0, 0))
+        center = (center.x() if self.pos_kind == "bottom" else center.y()) + pos + length / 2
+        if key == "chev":
+            if self._tray_popup is None:
+                from .tray_popups import TrayPopup
+                self._tray_popup = TrayPopup(self.hub)
+            if self._tray_popup.isVisible():
+                self._tray_popup.hide()
+                return
+            if self.hub.backend.tray_icons() is None:     # e.g. Windows 11 22H2+: no readable tray
+                self.hub.backend.peek_taskbar()
+                return
+            self._tray_popup.load()
+            pos_, rise = self.popup_pos(self._tray_popup.width(), self._tray_popup.height(), center)
+            self._tray_popup.popup_at(pos_, rise)
+        elif key in ("net", "bat"):
+            self.hub.do("control_center")
+        elif key == "vol":
+            if self._vol_popup is None:
+                from .tray_popups import VolumePopup
+                self._vol_popup = VolumePopup(self.hub)
+            if self._vol_popup.isVisible():
+                self._vol_popup.hide()
+                return
+            self._vol_popup.adjustSize()
+            pos_, rise = self.popup_pos(self._vol_popup.width(), self._vol_popup.sizeHint().height(), center)
+            self._vol_popup.open_at(pos_, rise)
+        elif key == "clock":
+            if self._cal_popup is None:
+                from .tray_popups import CalendarPopup
+                self._cal_popup = CalendarPopup(self.hub)
+            if self._cal_popup.isVisible():
+                self._cal_popup.hide()
+                return
+            pos_, rise = self.popup_pos(self._cal_popup.width(), self._cal_popup.height(), center)
+            self._cal_popup.open_at(pos_, rise)
+
+    def popup_pos(self, w, h, center=None, margin=16):
+        """Top-left (global) for a w x h popup next to the dock, plus the offset it rises from."""
+        lay, a, b = self.layout()
+        pill = self._rect(a, b - a, self.em, self.thick())
+        g0 = self.mapToGlobal(QPoint(0, 0))
+        screen = (QApplication.screenAt(g0 + QPoint(self.width() // 2, self.height() // 2))
+                  or QApplication.primaryScreen()).geometry()
+        gap = 10
+        if self.pos_kind == "bottom":
+            cx = center if center is not None else g0.x() + pill.center().x()
+            x, y = cx - w / 2, g0.y() + pill.top() - gap - (h - margin)
+            rise = QPoint(0, 40)
+        elif self.pos_kind == "left":
+            cy = center if center is not None else g0.y() + pill.center().y()
+            x, y = g0.x() + pill.right() + gap - margin, cy - h / 2
+            rise = QPoint(-40, 0)
+        else:
+            cy = center if center is not None else g0.y() + pill.center().y()
+            x, y = g0.x() + pill.left() - gap - (w - margin), cy - h / 2
+            rise = QPoint(40, 0)
+        x = max(screen.left() + 4 - margin, min(screen.right() - w + margin - 4, x))
+        y = max(screen.top() + 4 - margin, min(screen.bottom() - h + margin - 4, y))
+        return QPoint(int(x), int(y)), rise
+
+    # ------------------------------------------------------------ genie
+    def _genie_on(self):
+        return (self.hub.backend.supports_genie and self.c.get("genie", True)
+                and self.cfg.get("general", "animations"))
+
+    def _item_global_rect(self, it):
+        lay, _a, _b = self.layout()
+        for i, x, s in lay:
+            if i is it:
+                r = self._rect(x, s, self.em + self.pad(), s)
+                return r.translated(QPointF(self.mapToGlobal(QPoint(0, 0))))
+        return None
+
+    def _genie_widget(self):
+        if self._genie is None:
+            from .genie import Genie
+            self._genie = Genie()
+        return self._genie
+
+    def _minimize(self, it, wid):
+        be = self.hub.backend
+        dst = self._item_global_rect(it)
+        cap = be.capture_window(wid) if self._genie_on() and dst is not None else None
+        if cap is None:
+            be.minimize(wid)
+            return
+        img, (l, t, r, b) = cap
+        dpr = self.devicePixelRatioF() or 1.0
+        src = QRectF(l / dpr, t / dpr, (r - l) / dpr, (b - t) / dpr)
+        self._genie_widget().play(img, src, dst, self.pos_kind)
+        be.minimize(wid, animate=False)
+        # Keep the snapshot at full resolution for a crisp restore, but losslessly
+        # compressed (PNG, ~1 MB instead of ~8 MB raw), encoded off the GUI thread.
+        self._snaps[wid] = (img, src)
+        while len(self._snaps) > 4:
+            del self._snaps[next(iter(self._snaps))]
+
+        def encode(image=img):
+            from PyQt5.QtCore import QBuffer, QByteArray, QIODevice
+            data = QByteArray()
+            buf = QBuffer(data)
+            buf.open(QIODevice.WriteOnly)
+            image.save(buf, "PNG", 85)
+            buf.close()
+            return bytes(data)
+
+        def stored(data, w=wid, s=src, image=img):
+            cur = self._snaps.get(w)
+            if data and cur is not None and cur[0] is image:
+                self._snaps[w] = (data, s)
+        self.hub.run_async(encode, stored)
+
+    def _restore(self, it, wid):
+        be = self.hub.backend
+        snap = self._snaps.pop(wid, None)
+        dst = self._item_global_rect(it)
+        if snap is None or dst is None or not self._genie_on():
+            be.activate(wid)
+            return
+        img, src = snap
+        if isinstance(img, bytes):
+            from PyQt5.QtGui import QImage
+            img = QImage.fromData(img, "PNG")
+            if img.isNull():
+                be.activate(wid)
+                return
+        self._genie_widget().play(img, src, dst, self.pos_kind, reverse=True,
+                                  on_done=lambda: be.activate(wid, animate=False))
 
     def _on_fullscreen(self, fs):
         if not self.c.get("enabled", True):
@@ -176,7 +416,11 @@ class Dock(QWidget):
         return self.base + 2 * self.pad()
 
     def _width_of(self, it, size):
-        return max(2.0, self.gap() * 0.6) if it.kind == "sep" else size
+        if it.kind == "sep":
+            return max(2.0, self.gap() * 0.6)
+        if it.kind == "tray":
+            return self._tray_len()
+        return size
 
     def _screen(self):
         screen = QApplication.primaryScreen()
@@ -257,11 +501,13 @@ class Dock(QWidget):
             centers.append(x + w / 2)
             x += w + gap
         sizes = list(widths)
-        if self.mouse is not None and self.mag > self.base and self.hover > 0.001:
-            mm = self._main(self.mouse)
+        focus = self.mouse if self.mouse is not None else self.mag_at
+        if focus is not None and self.mag > self.base and self.hover > 0.001:
+            # after the cursor leaves, the icons shrink back smoothly around where it left
+            mm = self._main(focus)
             rng = self.base * 2.6
             for i, it in enumerate(self.items):
-                if it.kind == "sep":
+                if it.kind in ("sep", "tray"):
                     continue
                 d = abs(mm - centers[i])
                 f = math.cos(min(1.0, d / rng) * math.pi / 2) ** 2 if d < rng else 0.0
@@ -280,7 +526,8 @@ class Dock(QWidget):
         m = self._main(pt)
         c = self._cross(pt) - self._hide_offset()
         for it, x, s in lay:
-            if x - self.gap() / 2 <= m <= x + s + self.gap() / 2 and c <= self.em + self.pad() + s + 4:
+            cross = self.base if it.kind == "tray" else s
+            if x - self.gap() / 2 <= m <= x + s + self.gap() / 2 and c <= self.em + self.pad() + cross + 4:
                 return it
         return None
 
@@ -295,10 +542,14 @@ class Dock(QWidget):
         for attr, target in (("hover", self.hover_target), ("hidden_amt", self.hidden_target)):
             cur = getattr(self, attr)
             if abs(cur - target) > 0.002:
-                setattr(self, attr, target if not animate else cur + (target - cur) * 0.24)
+                # grow quickly, settle back a little slower so leaving the dock feels soft
+                k = 0.24 if target > cur or attr == "hidden_amt" else 0.15
+                setattr(self, attr, target if not animate else cur + (target - cur) * k)
                 busy = True
             else:
                 setattr(self, attr, target)
+        if self.hover <= 0.0 and self.mouse is None:
+            self.mag_at = None
         now = time.time()
         if any(now - i.bounce_t0 < 1.5 for i in self.items):
             busy = True
@@ -344,6 +595,13 @@ class Dock(QWidget):
             over_dock = over_dock and a - 6 <= m <= b + 6
         if over_dock:
             self.mouse = pt
+            self.mag_at = pt
+            under = self.item_at(pt)
+            hit = self._tray_part_at(pt) if under is not None and under.kind == "tray" else None
+            key = hit[0] if hit else None
+            if key != self.tray_hover:
+                self.tray_hover = key
+                self.update()
             self.hover_target = 1.0
             self.hidden_target = 0.0
             self._autohide_timer.stop()
@@ -353,6 +611,7 @@ class Dock(QWidget):
 
     def _mouse_gone(self):
         self.mouse = None
+        self.tray_hover = None
         self.hover_target = 0.0
         if self.autohide:
             self._autohide_timer.start(650)
@@ -388,10 +647,17 @@ class Dock(QWidget):
             it, _p = self.press
             self.press = None
             if self.item_at(QPointF(e.pos())) is it:
-                self._click(it)
+                self._click(it, QPointF(e.pos()))
 
     def wheelEvent(self, e):
         it = self.item_at(QPointF(e.pos()))
+        if it is not None and it.kind == "tray":
+            hit = self._tray_part_at(QPointF(e.pos()))
+            if hit and hit[0] == "vol" and self.hub.volume:
+                level = max(0, min(100, self.hub.volume[0] + (2 if e.angleDelta().y() > 0 else -2)))
+                self.hub.backend.set_volume(level)
+                self.hub._poll_volume()
+            return
         if it and it.windows:
             # scroll on an app to cycle through its windows
             self.hub.backend.activate(it.windows[-1 if e.angleDelta().y() > 0 else 0].id)
@@ -423,8 +689,12 @@ class Dock(QWidget):
         self._rebuild()
 
     # -------------------------------------------------------------- actions
-    def _click(self, it):
+    def _click(self, it, pt=None):
         be = self.hub.backend
+        if it.kind == "tray":
+            if pt is not None:
+                self._tray_click(pt)
+            return
         if it.kind == "launcher":
             self.hub.do("launcher")
         elif it.kind == "trash":
@@ -439,10 +709,13 @@ class Dock(QWidget):
                 if len(ids) > 1:
                     be.activate(ids[(ids.index(fg) + 1) % len(ids)])
                 else:
-                    be.minimize(fg)
+                    self._minimize(it, fg)
             else:
                 target = next((w for w in it.windows if not w.minimized), it.windows[0])
-                be.activate(target.id)
+                if be.is_minimized(target.id):
+                    self._restore(it, target.id)
+                else:
+                    be.activate(target.id)
             QTimer.singleShot(250, self.hub._poll_windows)
 
     def _launch(self, it):
@@ -568,6 +841,9 @@ class Dock(QWidget):
                 lift = abs(math.sin(t * math.pi * 2.4)) * self.base * 0.42 * (1 - t / 1.5)
             if it is self.drag and self.mouse is not None:
                 lift += max(0.0, self._cross(self.mouse) - self.em - self.thick() / 2 - s / 2)
+            if it.kind == "tray":
+                self._paint_tray(p, x, off)
+                continue
             r = self._rect(x, s, self.em + off + pad + lift, s)
             self._paint_item(p, it, r, icon_px)
             if it.windows:
@@ -575,10 +851,19 @@ class Dock(QWidget):
                 p.setPen(Qt.NoPen)
                 p.setBrush(pal.with_alpha(pal.fg, 210))
                 p.drawEllipse(dot)
-        if hovered is not None and hovered.kind != "sep" and self.c.get("show_labels", True):
+        if hovered is not None and hovered.kind == "tray":
+            hit = self._tray_part_at(self.mouse)
+            if hit:
+                tip = self._tray_tip(hit[0])
+                if tip:
+                    self._paint_label(p, tip, hit[1], hit[2], self.base, off)
+        elif hovered is not None and hovered.kind != "sep" and self.c.get("show_labels", True):
             for it, x, s in lay:
                 if it is hovered:
-                    self._paint_label(p, it, x, s, off)
+                    name = it.name or self.hub.backend.app_name(it.key)
+                    if it.windows and len(it.windows) > 1:
+                        name = f"{name}  ·  {len(it.windows)}"
+                    self._paint_label(p, name, x, s, s, off)
 
     def _paint_item(self, p, it, r, icon_px):
         pal = self.pal
@@ -605,7 +890,22 @@ class Dock(QWidget):
             return
         pm = self._icon(it, icon_px)
         if pm is not None and not pm.isNull():
-            p.drawPixmap(r, pm, QRectF(pm.rect()))
+            # QPainter's bilinear filter turns a 128 px icon drawn at 48 px soft and jaggy.
+            # Pre-scale with Qt's area-averaging filter to the exact device size instead.
+            dpr = self.devicePixelRatioF() or 1.0
+            px = max(1, int(round(r.width() * dpr)))
+            key = (it.kind, it.key or it.path, px)
+            spm = self._scaled.get(key)
+            if spm is None:
+                if len(self._scaled) > 500:
+                    self._scaled.clear()
+                spm = pm if pm.width() == px else pm.scaled(px, px, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                spm.setDevicePixelRatio(dpr)
+                self._scaled[key] = spm
+            w, h = spm.width() / dpr, spm.height() / dpr
+            x = round((r.center().x() - w / 2) * dpr) / dpr
+            y = round((r.center().y() - h / 2) * dpr) / dpr
+            p.drawPixmap(QPointF(x, y), spm)
             return
         p.setPen(Qt.NoPen)
         g = QLinearGradient(r.topLeft(), r.bottomRight())
@@ -617,15 +917,81 @@ class Dock(QWidget):
         p.setFont(font(r.height() * 0.42, QFont.DemiBold))
         p.drawText(r, Qt.AlignCenter, (it.name or "?")[:1].upper())
 
-    def _paint_label(self, p, it, x, s, off):
+    def _paint_tray(self, p, x, off):
         pal = self.pal
-        name = it.name or self.hub.backend.app_name(it.key)
-        if it.windows and len(it.windows) > 1:
-            name = f"{name}  ·  {len(it.windows)}"
+        b = self.base
+        c0 = self.em + off + self.pad()
+        horiz = self.pos_kind == "bottom"
+        fg = pal.fg
+        pos = x
+        for key, length in self._tray_parts():
+            r = self._rect(pos, length, c0, b)
+            pos += length
+            if key == self.tray_hover:
+                p.setPen(Qt.NoPen)
+                p.setBrush(pal.tile_hover)
+                p.drawRoundedRect(r.adjusted(1.5, 3, -1.5, -3) if horiz else r.adjusted(3, 1.5, -3, -1.5),
+                                  b * 0.2, b * 0.2)
+            g = b * 0.40
+            box = QRectF(r.center().x() - g / 2, r.center().y() - g / 2, g, g)
+            if key == "chev":
+                icons.draw(p, "chevron_up", box.adjusted(g * 0.1, g * 0.1, -g * 0.1, -g * 0.1), fg, 2.2)
+            elif key == "net":
+                kind = (self.hub.network or ("none", ""))[0]
+                glyph = {"wifi": "wifi", "ethernet": "ethernet"}.get(kind, "wifi_off")
+                icons.draw(p, glyph, box, fg)
+            elif key == "vol":
+                v = self.hub.volume
+                muted = bool(v and (v[1] or v[0] == 0))
+                icons.draw(p, "volume_mute" if muted else "volume", box, fg)
+            elif key == "bat":
+                pct, plugged = self.hub.battery or (0, False)
+                p.setFont(font(max(10.0, b * 0.24), QFont.DemiBold))
+                txt = f"{pct}%"
+                if horiz:
+                    bw, bh = b * 0.46, b * 0.24
+                    tw = p.fontMetrics().horizontalAdvance(txt)
+                    total = bw + 5 + tw
+                    x0 = r.center().x() - total / 2
+                    paint_battery(p, QRectF(x0, r.center().y() - bh / 2, bw, bh), pct, plugged, fg, pal)
+                    p.setPen(fg)
+                    p.drawText(QRectF(x0 + bw + 5, r.top(), tw + 2, r.height()), Qt.AlignLeft | Qt.AlignVCenter, txt)
+                else:
+                    bw, bh = b * 0.42, b * 0.22
+                    paint_battery(p, QRectF(r.center().x() - bw / 2, r.top() + r.height() * 0.2, bw, bh),
+                                  pct, plugged, fg, pal)
+                    p.setFont(font(max(9.0, b * 0.2), QFont.DemiBold))
+                    p.setPen(fg)
+                    p.drawText(QRectF(r.left(), r.top() + r.height() * 0.5, r.width(), r.height() * 0.4),
+                               Qt.AlignCenter, txt)
+            elif key == "clock":
+                t, d = self._clock_texts()
+                f1, f2 = self._tray_fonts()
+                if horiz:
+                    p.setFont(f1)
+                    p.setPen(fg)
+                    p.drawText(QRectF(r.left(), r.top() + b * 0.06, r.width(), b * 0.46),
+                               Qt.AlignHCenter | Qt.AlignBottom, t)
+                    p.setFont(f2)
+                    p.setPen(pal.fg2)
+                    p.drawText(QRectF(r.left(), r.top() + b * 0.54, r.width(), b * 0.4),
+                               Qt.AlignHCenter | Qt.AlignTop, d)
+                else:
+                    hh, _sep, mm = time.strftime("%H:%M" if self.cfg.get("general", "clock_24h")
+                                                 else "%I:%M").partition(":")
+                    p.setFont(f1)
+                    p.setPen(fg)
+                    p.drawText(QRectF(r.left(), r.top() + r.height() * 0.08, r.width(), r.height() * 0.42),
+                               Qt.AlignHCenter | Qt.AlignBottom, hh)
+                    p.drawText(QRectF(r.left(), r.top() + r.height() * 0.5, r.width(), r.height() * 0.42),
+                               Qt.AlignHCenter | Qt.AlignTop, mm)
+
+    def _paint_label(self, p, name, x, s, cross, off):
+        pal = self.pal
         p.setFont(font(12.5, QFont.Medium))
         tw = min(320, p.fontMetrics().horizontalAdvance(name) + 24)
         th = 26
-        c0 = self.em + off + self.pad() + s + 10
+        c0 = self.em + off + self.pad() + cross + 10
         if self.pos_kind == "bottom":
             cx = x + s / 2
             rect = QRectF(cx - tw / 2, self.height() - c0 - th, tw, th)

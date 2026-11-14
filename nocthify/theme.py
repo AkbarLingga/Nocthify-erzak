@@ -154,6 +154,28 @@ def paint_glass(p: QPainter, path: QPainterPath, pal: Palette, solid_black: bool
     p.restore()
 
 
+def paint_battery(p: QPainter, rect: QRectF, pct, plugged, color: QColor, pal: Palette):
+    """iOS-style battery: outline, nub and a fill that turns green (charging) or red (low)."""
+    p.save()
+    r = max(2.0, rect.height() * 0.28)
+    body = QRectF(rect.left(), rect.top(), rect.width() - rect.height() * 0.2, rect.height())
+    dim = QColor(color.red(), color.green(), color.blue(), 120)
+    p.setPen(QPen(dim, 1.0))
+    p.setBrush(Qt.NoBrush)
+    p.drawRoundedRect(body, r, r)
+    p.setPen(Qt.NoPen)
+    p.setBrush(dim)
+    nub_h = rect.height() * 0.36
+    p.drawRoundedRect(QRectF(body.right() + 0.8, rect.center().y() - nub_h / 2, rect.height() * 0.14, nub_h), 1, 1)
+    fill = pal.green if plugged else pal.red if pct <= 20 else color
+    inset = max(1.5, rect.height() * 0.15)
+    inner = body.adjusted(inset, inset, -inset, -inset)
+    inner.setWidth(max(1.5, inner.width() * max(0, min(100, pct)) / 100.0))
+    p.setBrush(fill)
+    p.drawRoundedRect(inner, r * 0.55, r * 0.55)
+    p.restore()
+
+
 def paint_tile(p: QPainter, rect: QRectF, radius: float, pal: Palette, hover=False,
                active=False):
     p.save()

@@ -39,9 +39,12 @@ Wi-Fi (nama jaringan), Bluetooth, Focus / Do Not Disturb, Dark Mode (beneran gan
 - Klik kanan: daftar jendela, Keep in Dock, Close, posisi (bawah/kiri/kanan), auto-hide, magnification.
 - Tombol **Apps** (launcher + pencarian, pengganti Start Menu) dan **Trash**.
 - Jendela yang di-maximize **berhenti di atas dock** (pakai AppBar resmi Windows).
+- **Area status** di ujung dock (seperti tray Windows, tapi melayang): jam & tanggal (klik = kalender), Wi-Fi, volume (klik = slider, scroll = ubah volume), baterai, dan tombol ^ untuk ikon tray tersembunyi.
+- **Efek genie** ala macOS: jendela tersedot ke ikon dock saat di-minimize, dan keluar lagi saat dibuka.
 
 ### Lainnya
 - **Settings lengkap**, semua berubah **langsung (live)** tanpa restart: tema (auto/gelap/terang), warna aksen, tingkat bening kaca, blur sistem (eksperimental), ukuran & posisi semuanya, dll.
+- **Tombol Windows** membuka Apps Nocthify yang muncul dari dock (bukan Start Menu dari kiri). Win+E, Win+D, dll tetap jalan normal.
 - Hotkey global: **Alt+Shift+Space** = Apps, **Alt+Shift+C** = Control Center (bisa diganti).
 - **Otomatis sembunyi saat game / video fullscreen.**
 - Mulai otomatis saat komputer menyala.

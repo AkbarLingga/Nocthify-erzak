@@ -50,6 +50,7 @@ DEFAULTS = {
         "clock_24h": True,
         "hotkey_launcher": "alt+shift+space",
         "hotkey_control_center": "alt+shift+c",
+        "win_key_launcher": True,   # Windows key opens Nocthify Apps instead of the Start menu
     },
     "island": {
         "enabled": True,
@@ -83,6 +84,8 @@ DEFAULTS = {
         "show_launcher": True,
         "show_trash": True,
         "show_labels": True,
+        "show_tray": True,          # clock, Wi-Fi, volume and battery at the end of the dock
+        "genie": True,              # macOS genie effect when minimising / restoring from the dock
         "pinned": [],               # [{"name": str, "path": str, "match": str}]
         "pinned_initialized": False,
     },

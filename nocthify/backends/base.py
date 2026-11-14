@@ -41,6 +41,7 @@ class Backend:
     name = "generic"
     supports_window_list = False
     supports_volume_poll = False
+    supports_genie = False       # can snapshot windows + minimise without the OS animation
 
     # ---------------------------------------------------------- windows
     def list_windows(self) -> list:
@@ -60,6 +61,16 @@ class Backend:
 
     def is_fullscreen_foreground(self) -> bool:
         return False
+
+    def is_minimized(self, wid) -> bool:
+        return False
+
+    def capture_window(self, wid):
+        """(QImage, (l, t, r, b) physical px) of a visible window, or None."""
+        return None
+
+    def restore_animation(self, gen=None):
+        pass
 
     def app_icon(self, app_id: str, size: int, wid=None):
         return None
@@ -161,6 +172,20 @@ class Backend:
     def wifi_name(self):
         return None
 
+    def network_state(self):
+        """('wifi', ssid) | ('ethernet', '') | ('none', '')."""
+        ssid = self.wifi_name()
+        if ssid:
+            return "wifi", ssid
+        if psutil is not None:
+            try:
+                for name, st in psutil.net_if_stats().items():
+                    if st.isup and not name.lower().startswith(("lo", "wl", "docker", "veth", "virbr", "br-", "tun", "tailscale")):
+                        return "ethernet", ""
+            except Exception:
+                pass
+        return "none", ""
+
     def is_dark_mode(self) -> bool:
         from ..theme import is_dark_system
         return is_dark_system()
@@ -176,6 +201,13 @@ class Backend:
         pass
 
     def peek_taskbar(self):
+        pass
+
+    def tray_icons(self):
+        """[{hwnd, uid, msg, tip, pixmap}] of notification-area icons, or None if unsupported."""
+        return None
+
+    def tray_click(self, icon, button="left"):
         pass
 
     def taskbar_rect(self):

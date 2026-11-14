@@ -148,10 +148,15 @@ class Launcher(GlassPopup):
             self._populate()
         self.search.clear()
         self._filter("")
-        g = QApplication.primaryScreen().availableGeometry()
-        x = g.center().x() - self.width() // 2
-        y = g.center().y() - self.height() // 2 - 20
-        self.popup_at(QPoint(x, y))
+        dock = self.hub.dock
+        if dock is not None and dock.isVisible():
+            # rise out of the dock, like Launchpad / the Windows 11 start menu
+            pos, rise = dock.popup_pos(self.width(), self.height(), margin=self.margin)
+        else:
+            g = QApplication.primaryScreen().availableGeometry()
+            pos = QPoint(g.center().x() - self.width() // 2, g.center().y() - self.height() // 2 - 20)
+            rise = QPoint(0, 30)
+        self.popup_at(pos, rise)
         self.search.setFocus()
 
     def refresh(self):

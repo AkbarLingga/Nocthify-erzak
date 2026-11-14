@@ -83,6 +83,14 @@ GLYPHS = {
     "keyboard": (0, '<rect x="2" y="5" width="20" height="14" rx="2.5"/><path d="M6 9h.01M10 9h.01M14 9h.01'
                     'M18 9h.01M6 13h.01M18 13h.01M10 13h4M7 16.5h10"/>'),
     "tasks": (0, '<path d="M3 12h4l3-8 4 16 3-8h4"/>'),
+    "chevron_up": (0, '<path d="m6 15 6-6 6 6"/>'),
+    "chevron_left": (0, '<path d="m15 6-6 6 6 6"/>'),
+    "chevron_right": (0, '<path d="m9 6 6 6-6 6"/>'),
+    "ethernet": (0, '<rect x="9" y="3" width="6" height="5" rx="1"/><rect x="3" y="16" width="6" height="5" rx="1"/>'
+                    '<rect x="15" y="16" width="6" height="5" rx="1"/><path d="M12 8v4M6 16v-4h12v4"/>'),
+    "wifi_off": (0, '<path d="M2 8.8a15 15 0 0 1 20 0" opacity=".35"/><path d="M5 12.4a10 10 0 0 1 14 0" '
+                    'opacity=".35"/><path d="M8.5 15.9a5 5 0 0 1 7 0" opacity=".35"/>'
+                    '<circle cx="12" cy="19.4" r="1" fill="{c}"/><path d="m3 3 18 18"/>'),
     "clipboard": (0, '<rect x="5" y="4" width="14" height="17" rx="2.5"/><path d="M9 4V3h6v1M9 10h6M9 14h6'
                      'M9 18h3"/>'),
 }

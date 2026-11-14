@@ -303,6 +303,9 @@ class SettingsWindow(QWidget):
         cv = self._card(v, "Keyboard shortcuts")
         self._text(cv, "general", "hotkey_launcher", "Open apps", "e.g. alt+shift+space")
         self._text(cv, "general", "hotkey_control_center", "Open Control Center", "e.g. alt+shift+c")
+        if IS_WIN:
+            self._bool(cv, "general", "win_key_launcher", "Windows key opens Nocthify Apps",
+                       "Tap the Windows key alone to open Apps above the Dock. Win+E, Win+D… still work")
         v.addStretch(1)
         return w
 
@@ -403,7 +406,12 @@ class SettingsWindow(QWidget):
         self._int(cv, "dock", "magnify_size", "Magnified size", 32, 128, " px")
         self._int(cv, "dock", "edge_margin", "Distance from edge", 0, 40, " px")
         self._bool(cv, "dock", "show_labels", "Show app names on hover")
+        self._bool(cv, "dock", "show_tray", "Status area",
+                   "Clock, Wi-Fi, volume and battery at the end of the Dock")
         cv = self._card(v, "Behaviour")
+        if IS_WIN:
+            self._bool(cv, "dock", "genie", "Genie effect",
+                       "Windows minimise into and restore out of their Dock icon (needs Animations on)")
         self._bool(cv, "dock", "autohide", "Automatically hide and show the Dock")
         self._bool(cv, "dock", "reserve_space", "Keep windows above the Dock",
                    "Maximised windows won't go under the Dock")

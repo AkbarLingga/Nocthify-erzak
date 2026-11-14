@@ -108,6 +108,100 @@ class WinHotkeys(QWidget):
         return False, 0
 
 
+class WinKeyHook:
+    """Tapping the Windows key alone opens Nocthify Apps instead of the Start menu.
+
+    A low-level keyboard hook watches only the two Windows keys.  Win+<anything>
+    combos (Win+E, Win+D, Win+L, ...) are left completely alone.  For a lone tap
+    the key-up is swallowed and replaced by "mask key + Win up", the same trick
+    AutoHotkey uses, so Windows never sees a bare Win press and Start stays shut.
+    """
+
+    MARK = 0x4E4F4354           # dwExtraInfo tag on events we inject ourselves ("NOCT")
+    VK_MASK = 0xE8              # unassigned virtual key
+
+    def __init__(self, callback):
+        import ctypes
+        import ctypes.wintypes as wt
+        self.ctypes = ctypes
+        self.callback = callback
+        self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+        LRESULT = ctypes.c_ssize_t
+
+        class KBDLLHOOKSTRUCT(ctypes.Structure):
+            _fields_ = [("vkCode", wt.DWORD), ("scanCode", wt.DWORD), ("flags", wt.DWORD),
+                        ("time", wt.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+        self.KB = KBDLLHOOKSTRUCT
+        self.HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wt.WPARAM, wt.LPARAM)
+        self.user32.SetWindowsHookExW.argtypes = [ctypes.c_int, self.HOOKPROC, wt.HINSTANCE, wt.DWORD]
+        self.user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        self.user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wt.WPARAM, wt.LPARAM]
+        self.user32.CallNextHookEx.restype = LRESULT
+        self.user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+        self.user32.keybd_event.argtypes = [wt.BYTE, wt.BYTE, wt.DWORD, ctypes.c_size_t]
+        ctypes.windll.kernel32.GetModuleHandleW.restype = wt.HMODULE
+        self._proc = self.HOOKPROC(self._hook)
+        self.hook = None
+        self.win_down = False
+        self.combo = False
+        # Windows silently drops a hook that ever answers too slowly; re-arm it now and then.
+        self._rearm = QTimer(interval=60000, timeout=self.reinstall)
+
+    def install(self):
+        if self.hook:
+            return True
+        mod = self.ctypes.windll.kernel32.GetModuleHandleW(None)
+        self.hook = self.user32.SetWindowsHookExW(13, self._proc, mod, 0)   # WH_KEYBOARD_LL
+        if not self.hook:
+            log.warning("Windows key hook failed (%s)", self.ctypes.get_last_error())
+            return False
+        self._rearm.start()
+        return True
+
+    def uninstall(self):
+        self._rearm.stop()
+        if self.hook:
+            self.user32.UnhookWindowsHookEx(self.hook)
+            self.hook = None
+
+    def reinstall(self):
+        if self.hook:
+            self.user32.UnhookWindowsHookEx(self.hook)
+            self.hook = None
+        self.install()
+
+    def _hook(self, code, wparam, lparam):
+        try:
+            if code == 0:
+                kb = self.KB.from_address(lparam)
+                if kb.dwExtraInfo != self.MARK:
+                    vk = kb.vkCode
+                    down = wparam in (0x100, 0x104)
+                    if vk in (0x5B, 0x5C):
+                        if down:
+                            if not self.win_down:
+                                self.win_down, self.combo = True, False
+                        else:
+                            lone = self.win_down and not self.combo
+                            self.win_down = False
+                            if lone:
+                                QTimer.singleShot(0, lambda v=vk: self._finish_tap(v))
+                                return 1          # swallow the key-up for now
+                    elif down and self.win_down:
+                        self.combo = True
+        except Exception:
+            pass
+        return self.user32.CallNextHookEx(None, code, wparam, lparam)
+
+    def _finish_tap(self, vk):
+        kd = self.user32.keybd_event
+        kd(self.VK_MASK, 0, 0, self.MARK)
+        kd(self.VK_MASK, 0, 2, self.MARK)
+        kd(vk, 0, 1 | 2, self.MARK)                       # extended key-up for the Win key
+        self.callback()
+
+
 class NocthifyApp:
     def __init__(self, qapp: QApplication):
         self.qapp = qapp
@@ -119,6 +213,7 @@ class NocthifyApp:
         self.cc = None
         self.settings = None
         self.hotkeys = None
+        self.winkey = None
 
         h = self.hub.handlers
         h["launcher"] = self.toggle_launcher
@@ -131,6 +226,7 @@ class NocthifyApp:
         from .ui.island import Island
         self.apply_taskbar_mode()
         self.dock = Dock(self.hub)
+        self.hub.dock = self.dock
         self.island = Island(self.hub)
         self._tray()
         self._hotkeys()
@@ -164,6 +260,12 @@ class NocthifyApp:
         if self.hotkeys is None:
             self.hotkeys = WinHotkeys(self.hub.do)
         g = self.config.get("general")
+        if g.get("win_key_launcher", True):
+            if self.winkey is None:
+                self.winkey = WinKeyHook(lambda: self.hub.do("launcher"))
+            self.winkey.install()
+        elif self.winkey is not None:
+            self.winkey.uninstall()
         failed = self.hotkeys.register({"launcher": g.get("hotkey_launcher", ""),
                                         "control_center": g.get("hotkey_control_center", "")})
         if failed:
@@ -246,6 +348,9 @@ class NocthifyApp:
             return
         self._restored = True
         try:
+            if self.winkey is not None:
+                self.winkey.uninstall()
+            self.backend.restore_animation()
             self.backend.release_edge()
             if IS_WIN:
                 self.backend.restore_taskbar()

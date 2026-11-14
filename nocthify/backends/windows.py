@@ -57,6 +57,7 @@ SPIF_SENDCHANGE = 0x0002
 KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP = 0x1, 0x2
 VK_MEDIA_NEXT, VK_MEDIA_PREV, VK_MEDIA_PLAY = 0xB0, 0xB1, 0xB3
 VK_LWIN = 0x5B
+_INJECT_MARK = 0x4E4F4354    # same tag as app.WinKeyHook.MARK
 
 WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
 
@@ -117,8 +118,31 @@ kernel32.CloseHandle.argtypes = [wt.HANDLE]
 kernel32.QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD, wt.LPWSTR,
                                                 ctypes.POINTER(wt.DWORD)]
 kernel32.GetCurrentThreadId.restype = wt.DWORD
+kernel32.VirtualAllocEx.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wt.DWORD, wt.DWORD]
+kernel32.VirtualAllocEx.restype = ctypes.c_void_p
+kernel32.VirtualFreeEx.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wt.DWORD]
+kernel32.ReadProcessMemory.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                                       ctypes.c_void_p]
 gdi32.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 6
 gdi32.CreateRoundRectRgn.restype = wt.HANDLE
+user32.GetDC.argtypes = [wt.HWND]
+user32.GetDC.restype = wt.HDC
+user32.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
+user32.PrintWindow.argtypes = [wt.HWND, wt.HDC, wt.UINT]
+gdi32.CreateCompatibleDC.argtypes = [wt.HDC]
+gdi32.CreateCompatibleDC.restype = wt.HDC
+gdi32.CreateCompatibleBitmap.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int]
+gdi32.CreateCompatibleBitmap.restype = wt.HBITMAP
+gdi32.SelectObject.argtypes = [wt.HDC, wt.HGDIOBJ]
+gdi32.SelectObject.restype = wt.HGDIOBJ
+gdi32.DeleteDC.argtypes = [wt.HDC]
+gdi32.DeleteObject.argtypes = [wt.HGDIOBJ]
+SPI_GETANIMATION, SPI_SETANIMATION = 0x0048, 0x0049
+
+
+class ANIMATIONINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.UINT), ("iMinAnimate", ctypes.c_int)]
+
 
 
 class APPBARDATA(ctypes.Structure):
@@ -181,10 +205,11 @@ def _powershell(script: str, timeout=8) -> str:
 
 
 def _send_keys(*vks):
+    # tagged so Nocthify's own Windows-key hook lets these through untouched
     for vk in vks:
-        user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY, 0)
+        user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY, _INJECT_MARK)
     for vk in reversed(vks):
-        user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+        user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, _INJECT_MARK)
 
 
 def _startfile(target: str) -> bool:
@@ -313,6 +338,7 @@ class WindowsBackend(Backend):
     name = "windows"
     supports_window_list = True
     supports_volume_poll = True
+    supports_genie = True
 
     def __init__(self):
         self._exe_cache = {}
@@ -324,6 +350,9 @@ class WindowsBackend(Backend):
         self._peek_until = 0.0
         self._reserved = None
         self._tray_hwnd = None
+        self._anim_lock = threading.Lock()
+        self._anim_saved = None
+        self._anim_gen = 0
         from ..config import config_dir
         self._state_path = os.path.join(config_dir(), "taskbar_state.json")
         self._orig_workarea = self._load_state().get("workarea") or self._get_workarea()
@@ -411,10 +440,13 @@ class WindowsBackend(Backend):
         h = user32.GetForegroundWindow()
         return int(h) if h else None
 
-    def activate(self, wid):
+    def activate(self, wid, animate=True):
         hwnd = wt.HWND(wid)
         if user32.IsIconic(hwnd):
-            user32.ShowWindow(hwnd, SW_RESTORE)
+            if animate:
+                user32.ShowWindow(hwnd, SW_RESTORE)
+            else:
+                self._without_min_anim(lambda: user32.ShowWindow(hwnd, SW_RESTORE))
         fg = user32.GetForegroundWindow()
         cur = kernel32.GetCurrentThreadId()
         fg_thread = user32.GetWindowThreadProcessId(fg, None) if fg else 0
@@ -428,13 +460,115 @@ class WindowsBackend(Backend):
             if attached:
                 user32.AttachThreadInput(fg_thread, cur, False)
         if not ok:
+            # Foreground lock: a (tagged) Alt tap counts as user input and unlocks switching.
+            user32.keybd_event(0x12, 0, 0, _INJECT_MARK)
+            user32.keybd_event(0x12, 0, KEYEVENTF_KEYUP, _INJECT_MARK)
+            ok = user32.SetForegroundWindow(hwnd)
+        if not ok:
             try:
                 user32.SwitchToThisWindow(hwnd, True)
             except Exception:
                 pass
 
-    def minimize(self, wid):
-        user32.ShowWindow(wt.HWND(wid), SW_MINIMIZE)
+    def minimize(self, wid, animate=True):
+        if animate:
+            user32.ShowWindow(wt.HWND(wid), SW_MINIMIZE)
+        else:
+            self._without_min_anim(lambda: user32.ShowWindow(wt.HWND(wid), SW_MINIMIZE))
+
+    # --- minimise/restore without the OS zoom animation (Nocthify draws its own genie).
+    # The switch is in-memory only (no SPIF_UPDATEINIFILE) and is put back ~0.6 s later.
+    def _without_min_anim(self, fn):
+        with self._anim_lock:
+            if self._anim_saved is None:
+                ai = ANIMATIONINFO(ctypes.sizeof(ANIMATIONINFO), 0)
+                user32.SystemParametersInfoW(SPI_GETANIMATION, ai.cbSize, ctypes.byref(ai), 0)
+                self._anim_saved = ai.iMinAnimate
+                if ai.iMinAnimate:
+                    ai.iMinAnimate = 0
+                    user32.SystemParametersInfoW(SPI_SETANIMATION, ai.cbSize, ctypes.byref(ai), 0)
+            self._anim_gen += 1
+            gen = self._anim_gen
+        try:
+            fn()
+        finally:
+            t = threading.Timer(0.6, self.restore_animation, (gen,))
+            t.daemon = True
+            t.start()
+
+    def restore_animation(self, gen=None):
+        with self._anim_lock:
+            if gen is not None and gen != self._anim_gen:
+                return
+            if self._anim_saved:
+                ai = ANIMATIONINFO(ctypes.sizeof(ANIMATIONINFO), self._anim_saved)
+                user32.SystemParametersInfoW(SPI_SETANIMATION, ai.cbSize, ctypes.byref(ai), 0)
+            self._anim_saved = None
+
+    def is_minimized(self, wid) -> bool:
+        return bool(user32.IsIconic(wt.HWND(wid)))
+
+    def window_rect(self, wid):
+        """Visible frame (l, t, r, b) in physical pixels, without the invisible resize borders."""
+        hwnd = wt.HWND(wid)
+        r = wt.RECT()
+        if dwmapi is not None and not dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(r), ctypes.sizeof(r)):
+            if r.right > r.left and r.bottom > r.top:
+                return (r.left, r.top, r.right, r.bottom)
+        if user32.GetWindowRect(hwnd, ctypes.byref(r)):
+            return (r.left, r.top, r.right, r.bottom)
+        return None
+
+    def capture_window(self, wid):
+        """Snapshot of a visible window: (QImage, (l, t, r, b) physical) or None."""
+        hwnd = wt.HWND(wid)
+        if user32.IsIconic(hwnd) or not user32.IsWindowVisible(hwnd):
+            return None
+        wr = wt.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(wr)):
+            return None
+        frame = self.window_rect(wid) or (wr.left, wr.top, wr.right, wr.bottom)
+        w, h = wr.right - wr.left, wr.bottom - wr.top
+        if w <= 0 or h <= 0 or w * h > 8000 * 8000:
+            return None
+        screen_dc = user32.GetDC(None)
+        mem = gdi32.CreateCompatibleDC(screen_dc)
+        bmp = gdi32.CreateCompatibleBitmap(screen_dc, w, h)
+        img = None
+        try:
+            old = gdi32.SelectObject(mem, bmp)
+            flags = 2 if (WINVER.major, WINVER.minor) >= (6, 3) else 0   # PW_RENDERFULLCONTENT on 8.1+
+            ok = user32.PrintWindow(hwnd, mem, flags)
+            gdi32.SelectObject(mem, old)
+            if ok:
+                from PyQt5.QtWinExtras import QtWin
+                img = QtWin.fromHBITMAP(bmp, QtWin.HBitmapNoAlpha).toImage()
+        finally:
+            gdi32.DeleteDC(mem)
+            user32.ReleaseDC(None, screen_dc)
+            gdi32.DeleteObject(bmp)
+        if img is None or img.isNull():
+            return None
+        l, t, r, b = frame
+        img = img.copy(max(0, l - wr.left), max(0, t - wr.top), r - l, b - t)
+        # Some GPU-rendered windows come back completely black: treat that as "no snapshot".
+        sx, sy = max(1, img.width() // 9), max(1, img.height() // 9)
+        if all(img.pixel(x, y) & 0xFFFFFF == 0 for x in range(sx, img.width(), sx)
+               for y in range(sy, img.height(), sy)):
+            return None
+        return img, frame
+
+    def network_state(self):
+        """('wifi', ssid) | ('ethernet', '') | ('none', '')."""
+        ssid = self.wifi_name()
+        if ssid:
+            return "wifi", ssid
+        flags = wt.DWORD()
+        try:
+            online = bool(ctypes.windll.wininet.InternetGetConnectedState(ctypes.byref(flags), 0))
+        except (OSError, AttributeError):
+            online = False
+        return ("ethernet", "") if online else ("none", "")
 
     def close(self, wid):
         user32.PostMessageW(wt.HWND(wid), WM_CLOSE, 0, 0)
@@ -948,6 +1082,135 @@ class WindowsBackend(Backend):
         r = wt.RECT()
         user32.GetWindowRect(main, ctypes.byref(r))
         return (r.left, r.top, r.right, r.bottom)
+
+    # ------------------------------------------------------- tray icons
+    # The notification-area icons live in two toolbars owned by explorer.exe (the visible
+    # strip and the "hidden icons" overflow).  Their button data points to explorer's
+    # TRAYDATA {hwnd, uID, uCallbackMessage, ..., hIcon}, read here with ReadProcessMemory.
+    # Win7 - Win10 (and Win11 before 22H2).  Returns None where that layout doesn't exist.
+    def tray_icons(self):
+        if ctypes.sizeof(ctypes.c_void_p) != 8:
+            return None
+        tray = user32.FindWindowW("Shell_TrayWnd", None)
+        notify = user32.FindWindowExW(tray, None, "TrayNotifyWnd", None) if tray else None
+        pager = user32.FindWindowExW(notify, None, "SysPager", None) if notify else None
+        bars = []
+        for parent in (pager, notify):
+            tb = user32.FindWindowExW(parent, None, "ToolbarWindow32", None) if parent else None
+            if tb:
+                bars.append(tb)
+                break
+        overflow = user32.FindWindowW("NotifyIconOverflowWindow", None)
+        tb = user32.FindWindowExW(overflow, None, "ToolbarWindow32", None) if overflow else None
+        if tb:
+            bars.append(tb)
+        if not bars:
+            return None
+        explorer_pid = _pid(bars[0])
+        hproc = kernel32.OpenProcess(0x0008 | 0x0010 | 0x0020 | 0x0400, False, explorer_pid)
+        if not hproc:
+            return None
+        remote = kernel32.VirtualAllocEx(hproc, None, 4096, 0x3000, 0x04)
+        out, seen = [], set()
+        try:
+            from PyQt5.QtWinExtras import QtWin
+
+            def send(h, msg, wp, lp):
+                r = ctypes.c_size_t(0)
+                user32.SendMessageTimeoutW(h, msg, wp, lp, SMTO_ABORTIFHUNG, 250, ctypes.byref(r))
+                return r.value
+
+            def read(addr, n):
+                buf = (ctypes.c_ubyte * n)()
+                if not kernel32.ReadProcessMemory(hproc, addr, buf, n, None):
+                    return None
+                return bytes(buf)
+
+            for tb in bars:
+                for i in range(min(64, send(tb, 0x418, 0, 0))):          # TB_BUTTONCOUNT
+                    if not send(tb, 0x417, i, remote):                   # TB_GETBUTTON
+                        continue
+                    btn = read(remote, 32)
+                    if not btn or btn[8] & 0x08:                         # TBSTATE_HIDDEN
+                        continue
+                    cmd = int.from_bytes(btn[4:8], "little", signed=True)
+                    td = read(int.from_bytes(btn[16:24], "little"), 32)
+                    if not td:
+                        continue
+                    hwnd = int.from_bytes(td[0:8], "little")
+                    uid = int.from_bytes(td[8:12], "little")
+                    cbmsg = int.from_bytes(td[12:16], "little")
+                    hicon = int.from_bytes(td[24:32], "little")
+                    if not hwnd or not user32.IsWindow(wt.HWND(hwnd)) or (hwnd, uid) in seen:
+                        continue
+                    if _pid(wt.HWND(hwnd)) == explorer_pid:   # clock/volume/network: the dock has those
+                        continue
+                    seen.add((hwnd, uid))
+                    tip = ""
+                    n = send(tb, 0x44B, cmd, remote + 64)                # TB_GETBUTTONTEXTW
+                    if 0 < n < 1000:
+                        raw = read(remote + 64, (n + 1) * 2)
+                        if raw:
+                            tip = raw.decode("utf-16-le", "replace").split("\x00")[0]
+                    pm = None
+                    if hicon:
+                        try:
+                            pm = QtWin.fromHICON(hicon)
+                        except Exception:
+                            pm = None
+                    if pm is None or pm.isNull():
+                        # some apps' tray HICONs can't be copied across processes: use the exe icon
+                        exe = self._exe_for(_pid(wt.HWND(hwnd)))
+                        pm = self._extract(exe, 32) if exe else None
+                    out.append({"hwnd": hwnd, "uid": uid, "msg": cbmsg, "tip": tip.strip(),
+                                "pixmap": pm if pm is not None and not pm.isNull() else None})
+        finally:
+            kernel32.VirtualFreeEx(hproc, remote, 0, 0x8000)
+            kernel32.CloseHandle(hproc)
+        return out
+
+    def _windows_of_pid(self, pid):
+        found = set()
+
+        def cb(h, _):
+            if user32.IsWindowVisible(h) and _pid(h) == pid:
+                found.add(int(h) if not isinstance(h, int) else h)
+            return True
+        user32.EnumWindows(WNDENUMPROC(cb), 0)
+        return found
+
+    def tray_click(self, icon, button="left"):
+        """Deliver a click to a tray icon the way explorer would (old + version-4 styles)."""
+        hwnd, uid, msg = wt.HWND(icon["hwnd"]), icon["uid"], icon["msg"]
+        if not user32.IsWindow(hwnd):
+            return
+        pid = _pid(hwnd)
+        try:
+            user32.AllowSetForegroundWindow(pid)
+        except Exception:
+            pass
+        post = user32.PostMessageW
+        if button == "right":
+            before = self._windows_of_pid(pid)
+            post(hwnd, msg, uid, 0x0204)            # WM_RBUTTONDOWN
+            post(hwnd, msg, uid, 0x0205)            # WM_RBUTTONUP
+
+            def fallback():
+                # Version-4 icons only answer WM_CONTEXTMENU; send it only if no menu showed up,
+                # so classic icons never get a second menu.
+                time.sleep(0.35)
+                if self._windows_of_pid(pid) - before:
+                    return
+                pt = wt.POINT()
+                user32.GetCursorPos(ctypes.byref(pt))
+                post(hwnd, msg, (pt.x & 0xFFFF) | ((pt.y & 0xFFFF) << 16), 0x007B | (uid << 16))
+            threading.Thread(target=fallback, daemon=True).start()
+        else:
+            post(hwnd, msg, uid, 0x0201)            # WM_LBUTTONDOWN
+            post(hwnd, msg, uid, 0x0202)            # WM_LBUTTONUP
+            if button == "double":
+                post(hwnd, msg, uid, 0x0203)        # WM_LBUTTONDBLCLK
+                post(hwnd, msg, uid, 0x0202)
 
     def peek_taskbar(self):
         main = user32.FindWindowW("Shell_TrayWnd", None)

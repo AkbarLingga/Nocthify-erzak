@@ -45,6 +45,7 @@ class Hub(QObject):
     fullscreen_changed = pyqtSignal(bool)
     activity = pyqtSignal(dict)
     timer_tick = pyqtSignal(object)      # remaining seconds or None
+    network_changed = pyqtSignal(object)  # ("wifi", ssid) | ("ethernet", "") | ("none", "")
     _async_done = pyqtSignal(object, object)
 
     def __init__(self, config, backend):
@@ -57,6 +58,8 @@ class Hub(QObject):
         self.battery = None
         self.stats = (0.0, 0.0)
         self.fullscreen = False
+        self.network = None
+        self.dock = None                     # set by the app; popups anchor to it
         self.timer_end = None
         self.cc_open = False
         self.handlers = {}
@@ -76,6 +79,7 @@ class Hub(QObject):
         self._t_stats = QTimer(self, interval=2000)
         self._t_stats.timeout.connect(self._poll_stats)
         self._t_theme = self._timer(8000, self._poll_theme)
+        self._t_network = self._timer(15000, self.poll_network)
         self._t_timer = QTimer(self, interval=1000)
         self._t_timer.timeout.connect(self._tick_timer)
         self._t_watchdog = self._timer(500 if backend.name == "windows" else 5000,
@@ -90,6 +94,7 @@ class Hub(QObject):
 
     def _initial(self):
         self._poll_windows()
+        self.poll_network()
         self._poll_battery()
         if self._t_volume:
             v = self.backend.get_volume()
@@ -182,6 +187,14 @@ class Hub(QObject):
             self.activity.emit({"kind": "lowbattery", "value": pct})
         if plugged or pct > 20:
             self._low_warned = False
+
+    def poll_network(self):
+        self.run_async(self.backend.network_state, self._set_network)
+
+    def _set_network(self, state):
+        if state and state != self.network:
+            self.network = state
+            self.network_changed.emit(state)
 
     def want_stats(self, on: bool):
         self._stats_users = max(0, self._stats_users + (1 if on else -1))
