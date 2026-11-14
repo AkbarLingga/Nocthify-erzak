@@ -491,6 +491,8 @@ class Dock(QWidget):
         self._update_mask()
         if repaint and self.isVisible():
             self.repaint()          # paint at the new size before the screen is composed again
+        if not full:
+            self.hub.schedule_trim(1500)   # back at rest: return what hovering used
 
     def _main_len(self):
         return self.width() if self.pos_kind == "bottom" else self.height()

@@ -74,6 +74,8 @@ class GlassPopup(QWidget):
                 pass
         if self._blur_on:
             self.hub.backend.apply_blur(self, self.RADIUS, True, self.pal.dark)
+        # once it has settled, hand the memory touched while opening back to Windows
+        self.hub.schedule_trim(2500)
         if animate:
             self._anim = QPropertyAnimation(self, b"windowOpacity", self)
             self._anim.setDuration(170)
@@ -94,6 +96,7 @@ class GlassPopup(QWidget):
     def hideEvent(self, ev):
         super().hideEvent(ev)
         self.closed.emit()
+        self.hub.schedule_trim(1500)
 
     def keyPressEvent(self, ev):
         if ev.key() == Qt.Key_Escape:

@@ -254,6 +254,7 @@ class Island(QWidget):
         if self.mode in ("compact", "activity") and self._big:
             self._resize_window(False)
             self.update()
+            self.hub.schedule_trim(1500)
 
     def _on_shape(self, rect):
         self.shape = QRectF(rect)
