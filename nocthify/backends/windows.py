@@ -158,6 +158,12 @@ class MONITORINFO(ctypes.Structure):
 user32.GetMonitorInfoW.argtypes = [wt.HANDLE, ctypes.POINTER(MONITORINFO)]
 shell32.SHGetFileInfoW.argtypes = [wt.LPCWSTR, wt.DWORD, ctypes.c_void_p, wt.UINT, wt.UINT]
 shell32.SHGetFileInfoW.restype = ctypes.c_size_t
+# same function, PIDL flavour (SHGFI_PIDL): first argument is an ITEMIDLIST*, not a string
+_SHGetFileInfoPidl = ctypes.WINFUNCTYPE(ctypes.c_size_t, ctypes.c_void_p, wt.DWORD, ctypes.c_void_p,
+                                        wt.UINT, wt.UINT)(("SHGetFileInfoW", shell32))
+shell32.SHParseDisplayName.argtypes = [wt.LPCWSTR, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+                                       wt.ULONG, ctypes.c_void_p]
+shell32.SHParseDisplayName.restype = ctypes.c_long
 shell32.SHAppBarMessage.argtypes = [wt.DWORD, ctypes.POINTER(APPBARDATA)]
 shell32.SHAppBarMessage.restype = ctypes.c_size_t
 
@@ -691,7 +697,19 @@ class WindowsBackend(Backend):
         try:
             from PyQt5.QtWinExtras import QtWin
             info = SHFILEINFOW()
-            if not shell32.SHGetFileInfoW(path, 0, ctypes.byref(info), ctypes.sizeof(info), 0x4000):
+            if path.lower().startswith("shell:"):
+                # virtual items (Store apps in shell:AppsFolder) only resolve through a PIDL
+                pidl = ctypes.c_void_p()
+                if shell32.SHParseDisplayName(path, None, ctypes.byref(pidl), 0, None) or not pidl:
+                    return None
+                try:
+                    ok = _SHGetFileInfoPidl(pidl, 0, ctypes.byref(info), ctypes.sizeof(info),
+                                            0x4000 | 0x8)     # SYSICONINDEX | PIDL
+                finally:
+                    ctypes.windll.ole32.CoTaskMemFree(pidl)
+                if not ok:
+                    return None
+            elif not shell32.SHGetFileInfoW(path, 0, ctypes.byref(info), ctypes.sizeof(info), 0x4000):
                 return None
             if self._imagelists is None:
                 self._imagelists = {}
@@ -824,23 +842,108 @@ class WindowsBackend(Backend):
         except OSError:
             return False
 
+    # Start-menu folders that only hold legacy admin / system tools nobody launches from a dock
+    _SKIP_DIRS = {"administrative tools", "windows administrative tools", "windows powershell",
+                  "accessibility", "windows ease of access", "microsoft office tools",
+                  "system tools", "windows system", "documentation"}
+    # ...except these, which are genuinely useful
+    _KEEP = {"command prompt", "file explorer", "windows powershell", "task manager",
+             "control panel"}
+    # individual legacy/bloat entries (desktop shortcuts and Store apps alike)
+    _SKIP_NAMES = {"steps recorder", "windows fax and scan", "math input panel", "internet explorer",
+                   "wordpad", "windows media player", "windows media player legacy", "character map",
+                   "quick assist", "speech recognition", "immersive control panel", "run",
+                   "computer", "administrative tools", "tips", "get help", "feedback hub",
+                   "mixed reality portal", "3d viewer", "paint 3d", "xbox console companion",
+                   "cortana", "connect", "windows backup", "telemetry log for office",
+                   "office language preferences", "reload configuration",
+                   "install additional tools for node.js"}
+    _SKIP_WORDS = ("uninstall", "readme", "help", "documentation", "website", "license",
+                   "release notes", "manual", "module docs", "faq", "support", "what is new",
+                   "what's new")
+    _STORE_TTL = 600.0
+
+    def _store_query(self):
+        """Packaged (Microsoft Store / MSIX) apps — WhatsApp, Spotify, Calculator… — as
+        (name, AppUserModelID). They have no .lnk in the Start-menu folders."""
+        if not IS_WIN10_PLUS:
+            return []
+        out = _powershell("[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+                          "Get-StartApps | ForEach-Object { $_.Name + \"`t\" + $_.AppID }", 15)
+        apps = []
+        for line in out.splitlines():
+            name, _, aid = line.strip().partition("\t")
+            if name and "!" in aid:          # '!' = packaged app; plain shortcuts come from the walk
+                apps.append((name, aid))
+        return apps
+
+    def _store_refresh(self):
+        try:
+            self._store_apps = self._store_query()
+            self._store_t = time.monotonic()
+        except Exception:
+            pass
+
+    def prefetch_apps(self):
+        """Warm the Store-app list off the UI thread so the first launcher open is instant."""
+        th = getattr(self, "_store_thread", None)
+        if th is None or not th.is_alive():
+            self._store_thread = threading.Thread(target=self._store_refresh, daemon=True)
+            self._store_thread.start()
+
+    def _packaged_apps(self):
+        if getattr(self, "_store_apps", None) is None:
+            th = getattr(self, "_store_thread", None)
+            if th is not None and th.is_alive():
+                th.join(4)
+            if getattr(self, "_store_apps", None) is None:
+                self._store_refresh()
+        elif time.monotonic() - self._store_t > self._STORE_TTL:
+            self.prefetch_apps()            # stale: refresh in the background for next time
+        return self._store_apps or []
+
+    def _skip_app(self, low: str) -> bool:
+        return low in self._SKIP_NAMES or any(s in low for s in self._SKIP_WORDS)
+
+    @staticmethod
+    def _web_link(path: str) -> bool:
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    if line.lower().startswith("url="):
+                        return line[4:].strip().lower().startswith(("http:", "https:"))
+        except OSError:
+            pass
+        return False
+
     def list_apps(self) -> list:
         roots = [os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
                               r"Microsoft\Windows\Start Menu\Programs"),
                  os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs")]
         seen, apps = set(), []
-        skip = ("uninstall", "readme", "help", "documentation", "website", "license", "release notes")
         for root in roots:
-            for dirpath, _dirs, files in os.walk(root):
+            for dirpath, dirs, files in os.walk(root):
+                folder = os.path.basename(dirpath).lower() if dirpath != root else ""
+                legacy = folder in self._SKIP_DIRS
                 for f in files:
-                    if not f.lower().endswith((".lnk", ".url", ".appref-ms")):
+                    fl = f.lower()
+                    if not fl.endswith((".lnk", ".url", ".appref-ms")):
                         continue
                     name = os.path.splitext(f)[0]
                     low = name.lower()
-                    if any(s in low for s in skip) or low in seen:
+                    if low in seen or self._skip_app(low) or (legacy and low not in self._KEEP):
                         continue
+                    path = os.path.join(dirpath, f)
+                    if fl.endswith(".url") and self._web_link(path):
+                        continue                    # website bookmarks, not apps
                     seen.add(low)
-                    apps.append(AppEntry(name, os.path.join(dirpath, f)))
+                    apps.append(AppEntry(name, path))
+        for name, aid in self._packaged_apps():
+            low = name.lower()
+            if low in seen or self._skip_app(low):
+                continue
+            seen.add(low)
+            apps.append(AppEntry(name, "shell:AppsFolder\\" + aid, keywords=aid.split("_")[0]))
         extras = [("Settings", "ms-settings:" if IS_WIN10_PLUS else "control.exe", "settings"),
                   ("Calculator", "calc.exe", "calculator"),
                   ("Control Panel", "control.exe", "sliders"),
@@ -1063,12 +1166,33 @@ class WindowsBackend(Backend):
             winreg.SetValueEx(key, "AppsUseLightTheme", 0, winreg.REG_DWORD, 0 if dark else 1)
             winreg.SetValueEx(key, "SystemUsesLightTheme", 0, winreg.REG_DWORD, 0 if dark else 1)
             winreg.CloseKey(key)
-            res = ctypes.c_size_t(0)
-            buf = ctypes.create_unicode_buffer("ImmersiveColorSet")
+        except OSError:
+            return
+        # Telling every window about it takes 0.5-2 s (each app repaints) and, done from the UI
+        # thread, re-enters our own window procedures mid-click. Do it from a worker instead;
+        # rapid toggles collapse into one broadcast of the final state.
+        if getattr(self, "_dm_lock", None) is None:
+            self._dm_lock = threading.Lock()
+            self._dm_running = False
+        with self._dm_lock:
+            self._dm_pending = True
+            if self._dm_running:
+                return
+            self._dm_running = True
+        threading.Thread(target=self._broadcast_theme, daemon=True).start()
+
+    def _broadcast_theme(self):
+        buf = ctypes.create_unicode_buffer("ImmersiveColorSet")
+        res = ctypes.c_size_t(0)
+        while True:
+            time.sleep(0.12)                 # let a quick double-click settle first
+            with self._dm_lock:
+                if not self._dm_pending:
+                    self._dm_running = False
+                    return
+                self._dm_pending = False
             user32.SendMessageTimeoutW(wt.HWND(0xFFFF), 0x001A, 0, ctypes.addressof(buf),
                                        SMTO_ABORTIFHUNG, 200, ctypes.byref(res))
-        except OSError:
-            pass
 
     # ------------------------------------------------------- native taskbar
     def _tray_windows(self):

@@ -110,6 +110,9 @@ class Backend:
     def list_apps(self) -> list:
         return []
 
+    def prefetch_apps(self):
+        """Optionally warm slow parts of list_apps() in the background."""
+
     def default_pinned(self) -> list:
         return []
 

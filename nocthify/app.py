@@ -16,9 +16,9 @@ if IS_LINUX and os.environ.get("WAYLAND_DISPLAY") and not os.environ.get("QT_QPA
     os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 from PyQt5.QtCore import QCoreApplication, QObject, Qt, QTimer, pyqtSignal  # noqa: E402
-from PyQt5.QtGui import QPixmapCache  # noqa: E402
+from PyQt5.QtGui import QColor, QPalette, QPixmapCache  # noqa: E402
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
-from PyQt5.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget  # noqa: E402
+from PyQt5.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QToolTip, QWidget  # noqa: E402
 
 from . import icons  # noqa: E402
 from .config import APP_NAME, Config, config_dir  # noqa: E402
@@ -48,6 +48,18 @@ def _setup_logging():
         log.error("Unhandled error:\n%s", "".join(traceback.format_exception(etype, value, tb)))
 
     sys.excepthook = hook
+    # Native crashes (inside Qt / a Win32 call) bypass excepthook and vanish silently:
+    # have Python dump every thread's stack into the log when that happens.
+    try:
+        import faulthandler
+        global _fault_file
+        _fault_file = open(path, "a", encoding="utf-8")
+        faulthandler.enable(_fault_file, all_threads=True)
+    except Exception:
+        pass
+
+
+_fault_file = None
 
 
 class WinHotkeys(QWidget):
@@ -151,9 +163,11 @@ class NocthifyApp:
         if IS_WIN:
             QTimer.singleShot(20000, self._ensure_exe)
         self.config.changed.connect(self.on_config)
-        self.qapp.setStyleSheet(menu_stylesheet(self.hub.palette))
+        self._style_menus()
         self.hub.theme_changed.connect(self._on_theme)
         QTimer.singleShot(1200, lambda: self.hub.notify("Nocthify is ready", "star", kind="system"))
+        # Store apps (WhatsApp, Spotify…) are listed via a slow-ish query: warm it up early
+        QTimer.singleShot(3000, self.hub.backend.prefetch_apps)
 
     # ------------------------------------------------------------- pieces
     def _tray(self):
@@ -267,8 +281,21 @@ class NocthifyApp:
         if section in ("island", "general", "custom_shortcuts", "*"):
             self.island.reload()
 
+    def _style_menus(self):
+        # Deliberately NOT qapp.setStyleSheet(): an application-wide stylesheet re-polishes every
+        # widget in the process on each theme flip (~0.4 s freeze) and slows every paint after.
+        pal = self.hub.palette
+        if getattr(self, "_tray_menu", None) is not None:
+            self._tray_menu.setStyleSheet(menu_stylesheet(pal))
+        tip = QPalette(QToolTip.palette())
+        bg = QColor(pal.base)
+        bg.setAlpha(255)
+        tip.setColor(QPalette.ToolTipBase, bg)
+        tip.setColor(QPalette.ToolTipText, pal.fg)
+        QToolTip.setPalette(tip)
+
     def _on_theme(self):
-        self.qapp.setStyleSheet(menu_stylesheet(self.hub.palette))
+        self._style_menus()
         self.dock.update()
         self.island.update()
 

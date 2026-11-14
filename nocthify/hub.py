@@ -84,6 +84,7 @@ class Hub(QObject):
         self._low_warned = False
         self._dark = None
         self.palette = None
+        self._t_palette = QTimer(self, singleShot=True, interval=40, timeout=self.refresh_palette)
         self._async_done.connect(lambda cb, res: cb(res) if cb else None)
         self._media_raw.connect(self._on_media_session)
         self.media_watcher = None        # started lazily: costs ~6 MB, only worth it once music plays
@@ -147,9 +148,21 @@ class Hub(QObject):
         theme = g.get("theme", "auto")
         dark = is_dark_system() if theme == "auto" else theme == "dark"
         self._dark = dark
-        self.palette = Palette(dark, g.get("accent", "#0A84FF"), g.get("glass_opacity", 0.62))
+        sig = (dark, g.get("accent", "#0A84FF"), g.get("glass_opacity", 0.62))
+        if emit and sig == getattr(self, "_pal_sig", None):
+            return          # any other "general" setting changed: nothing to repaint
+        self._pal_sig = sig
+        self.palette = Palette(*sig)
         if emit:
             self.theme_changed.emit()
+
+    def request_palette_refresh(self):
+        """Coalesced refresh: a burst of dark/light flips repaints once, after the burst."""
+        self._t_palette.start()
+
+    def set_dark_mode(self, dark: bool):
+        self.backend.set_dark_mode(dark)    # registry write is instant; the broadcast is async
+        self.request_palette_refresh()
 
     def notify(self, text: str, glyph: str = "bell_off", color=None, kind="notice"):
         if self.config.get("general", "do_not_disturb") and kind == "notice":
@@ -411,7 +424,7 @@ class Hub(QObject):
         if self.config.get("general", "theme") != "auto":
             return
         if is_dark_system() != self._dark:
-            self.refresh_palette()
+            self.request_palette_refresh()
 
     # ---------------------------------------------------------------- timer
     def toggle_timer(self):
@@ -459,8 +472,7 @@ class Hub(QObject):
             self.open_media()
         elif name == "dark_mode":
             dark = not self.backend.is_dark_mode()
-            self.backend.set_dark_mode(dark)
-            QTimer.singleShot(600, self.refresh_palette)
+            self.set_dark_mode(dark)
             self.notify("Dark Mode " + ("On" if dark else "Off"), "contrast", kind="system")
         elif name == "dnd":
             on = not self.config.get("general", "do_not_disturb")

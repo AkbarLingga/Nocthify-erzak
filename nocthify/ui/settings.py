@@ -89,15 +89,55 @@ class SettingsWindow(QWidget):
         self.stack = QStackedWidget()
         lay.addWidget(self.side)
         lay.addWidget(self.stack, 1)
-        self.side.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self._built = set()
+        self._dirty = False
+        self._accent = None
+        self._t_theme = QTimer(self, singleShot=True, interval=0, timeout=self._apply_theme)
+        self.side.currentRowChanged.connect(self._goto)
         self.rebuild()
-        hub.theme_changed.connect(self.rebuild)
+        hub.theme_changed.connect(self._on_theme)
 
     # ------------------------------------------------------------ building
+    FG_PAGES = {1}          # pages that bake the foreground colour into icons (Island: shortcuts)
+
+    def _on_theme(self):
+        # Never tear the UI down inside the signal (the click that changed the theme may be
+        # coming from one of our own widgets), and never twice for a burst of theme flips.
+        if self.isVisible():
+            self._t_theme.start()
+        else:
+            self._dirty = True
+
+    def _apply_theme(self):
+        if self.hub.palette.accent.name() != self._accent:
+            self.rebuild()                  # accent is baked into switches/swatches/sidebar
+            return
+        # plain dark <-> light flip: restyle in place instead of rebuilding widgets
+        self._style()
+        cur = self.stack.currentIndex()
+        stale = self._built & self.FG_PAGES
+        self._built -= stale
+        if cur in stale:
+            self._goto(cur)
+
+    def showEvent(self, ev):
+        if self._dirty:
+            self.rebuild()
+        super().showEvent(ev)
+
+    def _builders(self):
+        return (self._page_general, self._page_island, self._page_dock, self._page_cc,
+                self._page_shortcuts, self._page_about)
+
     def rebuild(self):
+        """Pages are built lazily (only the one on screen): a rebuild costs one page, not six."""
+        self._t_theme.stop()
+        self._dirty = False
+        self._accent = self.hub.palette.accent.name()
         row = max(0, self.side.currentRow())
         self._building = True
         pal = self.hub.palette
+        self.side.blockSignals(True)
         self.side.clear()
         while self.stack.count():
             w = self.stack.widget(0)
@@ -107,12 +147,30 @@ class SettingsWindow(QWidget):
             it = QListWidgetItem(icons.icon(glyph, pal.accent.name(), 18), "  " + name)
             it.setSizeHint(QSize(190, 38))
             self.side.addItem(it)
-        for builder in (self._page_general, self._page_island, self._page_dock, self._page_cc,
-                        self._page_shortcuts, self._page_about):
-            self.stack.addWidget(self._scroll(builder()))
-        self.side.setCurrentRow(row)
+        self._built = set()
+        for _ in self.PAGES:
+            self.stack.addWidget(QWidget())     # placeholder until the page is visited
         self._style()
         self._building = False
+        self.side.setCurrentRow(row)
+        self.side.blockSignals(False)
+        self._goto(row)
+
+    def _goto(self, row):
+        if row < 0 or row >= self.stack.count():
+            return
+        if row not in self._built:
+            self._building = True
+            try:
+                page = self._scroll(self._builders()[row]())
+            finally:
+                self._building = False
+            old = self.stack.widget(row)
+            self.stack.insertWidget(row, page)
+            self.stack.removeWidget(old)
+            old.deleteLater()
+            self._built.add(row)
+        self.stack.setCurrentIndex(row)
 
     def _style(self):
         pal = self.hub.palette

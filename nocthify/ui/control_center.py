@@ -180,8 +180,7 @@ class ControlCenter(GlassPopup):
     def _toggle_dark(self):
         dark = not self.t_dark.active
         self.t_dark.set_state(active=dark, subtitle="Dark" if dark else "Light")
-        self.hub.backend.set_dark_mode(dark)
-        QTimer.singleShot(600, self.hub.refresh_palette)
+        self.hub.set_dark_mode(dark)
 
     def _toggle_mute(self):
         v = self.hub.volume or (self.s_vol.value, False)
