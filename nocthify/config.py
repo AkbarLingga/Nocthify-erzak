@@ -81,7 +81,8 @@ DEFAULTS = {
         "magnify_size": 74,
         "autohide": False,
         "reserve_space": True,      # keep maximized windows above the dock
-        "edge_margin": 8,
+        "edge_margin": 4,           # gap between the screen edge and the dock (macOS-like)
+        "margin_rev": 2,
         "show_running": True,
         "show_launcher": True,
         "show_trash": True,
@@ -137,6 +138,10 @@ class Config(QObject):
             with open(self.path, "r", encoding="utf-8") as fh:
                 user = json.load(fh)
             self.data = _merge(DEFAULTS, user)
+            dock = user.get("dock") if isinstance(user.get("dock"), dict) else {}
+            if "margin_rev" not in dock and dock.get("edge_margin", 8) == 8:
+                self.data["dock"]["edge_margin"] = 4   # old default 8 px: move the dock closer
+                self._save_timer.start()
         except FileNotFoundError:
             self.data = copy.deepcopy(DEFAULTS)
             self._write()

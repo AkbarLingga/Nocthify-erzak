@@ -21,7 +21,7 @@ import sys
 import time
 
 from PyQt5.QtCore import QEasingCurve, QPointF, QRectF, Qt, QTimer, QVariantAnimation
-from PyQt5.QtGui import QColor, QFont, QLinearGradient, QPainter, QRegion
+from PyQt5.QtGui import QColor, QFont, QLinearGradient, QPainter, QPixmap, QRegion
 from PyQt5.QtWidgets import QApplication, QMenu, QWidget
 
 from .. import icons
@@ -58,6 +58,9 @@ class Island(QWidget):
         self.inside = False
         self.bars = [0.4, 0.7, 0.5, 0.8]
         self.bar_targets = [0.5] * 4
+        self._bars_rect = None   # the small area the equalizer animation repaints
+        self._bars_bg = None     # (key, pixmap) of the pill under that area, so a bars frame
+        self._no_bars = False    # only draws 4 bars instead of the whole island
         self._minute = None
         self._art = None
         self._art_key = None
@@ -338,7 +341,8 @@ class Island(QWidget):
                 self.bar_targets[i] = random.uniform(0.25, 1.0)
             self.bars[i] += (self.bar_targets[i] - self.bars[i]) * 0.45
         r = self.shape
-        self.update(QRectF(r.right() - 60, r.top(), 60, r.height()).toAlignedRect())
+        self._bars_rect = QRectF(r.right() - 60, r.top(), 60, r.height()).toAlignedRect()
+        self.update(self._bars_rect)
 
     def enterEvent(self, e):
         pass
@@ -457,8 +461,62 @@ class Island(QWidget):
         m.exec_(gpos)
 
     # ------------------------------------------------------------- painting
-    def paintEvent(self, _e):
+    def paintEvent(self, e):
+        if self._paint_bars_only(e):
+            return
+        self._bars_bg = None
         p = QPainter(self)
+        self._paint_all(p)
+
+    def _paint_bars_only(self, e):
+        """Equalizer frame: reuse a cached picture of the pill and draw just the bars."""
+        rect = self._bars_rect
+        if (rect is None or e.rect() != rect or self.mode != "compact" or self.timer_left
+                or not self.hub.media or not self.c.get("show_media", True) or self._lyric_pill()
+                or self.anim.state() == QVariantAnimation.Running):
+            return False
+        dpr = self.devicePixelRatioF() or 1.0
+        r = self.shape
+        key = (rect.x(), rect.y(), rect.width(), rect.height(), dpr, r.x(), r.y(), r.width(), r.height())
+        if self._bars_bg is None or self._bars_bg[0] != key:
+            # snap to whole device pixels so the cached pixels land exactly where they were
+            x0 = int((rect.x() - 2) * dpr)
+            y0 = int((rect.y() - 2) * dpr)
+            x1 = int((rect.right() + 3) * dpr + 1)
+            y1 = int((rect.bottom() + 3) * dpr + 1)
+            pm = QPixmap(x1 - x0, y1 - y0)
+            pm.setDevicePixelRatio(dpr)
+            pm.fill(Qt.transparent)
+            q = QPainter(pm)
+            q.translate(-x0 / dpr, -y0 / dpr)
+            self._no_bars = True
+            try:
+                self._paint_all(q)
+            finally:
+                self._no_bars = False
+                q.end()
+            self._bars_bg = (key, pm, QPointF(x0 / dpr, y0 / dpr))
+        p = QPainter(self)
+        p.drawPixmap(self._bars_bg[2], self._bars_bg[1])
+        p.setRenderHint(QPainter.Antialiasing)
+        self._paint_bars(p, r)
+        return True
+
+    def _bars_geo(self, r):
+        bw, gap = 3.0, 2.6
+        right = r.right() - (15 if not self.notch else 18)
+        return right - (4 * bw + 3 * gap), bw, gap, r.height() * 0.5
+
+    def _paint_bars(self, p, r):
+        x, bw, gap, h = self._bars_geo(r)
+        cy = r.center().y()
+        p.setPen(Qt.NoPen)
+        p.setBrush(self.pal.accent if not self.black() else QColor("#7CF29A"))
+        for i, v in enumerate(self.bars):
+            bh = max(3.0, h * v)
+            p.drawRoundedRect(QRectF(x + i * (bw + gap), cy - bh / 2, bw, bh), 1.5, 1.5)
+
+    def _paint_all(self, p):
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
         r = self.shape
@@ -532,14 +590,9 @@ class Island(QWidget):
             icons.draw(p, "timer", QRectF(right - 82, cy - 8, 16, 16), self.pal.orange)
             return
         if self.hub.media and self.c.get("show_media", True):
-            col = self.pal.accent if not self.black() else QColor("#7CF29A")
-            bw, gap, h = 3.0, 2.6, r.height() * 0.5
-            x = right - (4 * bw + 3 * gap)
-            p.setPen(Qt.NoPen)
-            p.setBrush(col)
-            for i, v in enumerate(self.bars):
-                bh = max(3.0, h * v)
-                p.drawRoundedRect(QRectF(x + i * (bw + gap), cy - bh / 2, bw, bh), 1.5, 1.5)
+            x = self._bars_geo(r)[0]
+            if not self._no_bars:
+                self._paint_bars(p, r)
             art = self._media_art(18)
             if art is not None:
                 p.drawPixmap(QRectF(x - 28, cy - 9, 18, 18), art, QRectF(art.rect()))

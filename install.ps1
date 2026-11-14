@@ -151,12 +151,20 @@ if ($Win7 -or $Win8) {
 if ($LASTEXITCODE -ne 0) { throw "pip install failed - check your internet connection and run again." }
 Ok "Dependencies installed"
 
+# Nocthify.exe: shows as "Nocthify" (one process) in Task Manager instead of "Python"
+$Launcher = $VPyw
+try {
+    & $VPy (Join-Path $AppDir "run.pyw") --make-exe | Out-Null
+    $own = Join-Path $VenvDir "Scripts\Nocthify.exe"
+    if (Test-Path $own) { $Launcher = $own; Ok "Nocthify.exe ready" }
+} catch { Warn "Using pythonw.exe (could not build Nocthify.exe)" }
+
 # ------------------------------------------------------------ shortcuts ---
 $wsh = New-Object -ComObject WScript.Shell
 $startMenu = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
 foreach ($def in @(@("Nocthify", ""), @("Nocthify Settings", "--settings"), @("Restore Windows Taskbar", "--restore-taskbar"))) {
     $lnk = $wsh.CreateShortcut((Join-Path $startMenu "$($def[0]).lnk"))
-    $lnk.TargetPath = $VPyw
+    $lnk.TargetPath = $Launcher
     $lnk.Arguments = "`"$AppDir\run.pyw`" $($def[1])".Trim()
     $lnk.WorkingDirectory = $AppDir
     $lnk.Description = "Nocthify - erzak"
@@ -165,7 +173,7 @@ foreach ($def in @(@("Nocthify", ""), @("Nocthify Settings", "--settings"), @("R
 Ok "Start Menu shortcuts created"
 
 Say "Starting Nocthify..."
-Start-Process $VPyw -ArgumentList "`"$AppDir\run.pyw`"" -WorkingDirectory $AppDir
+Start-Process $Launcher -ArgumentList "`"$AppDir\run.pyw`"" -WorkingDirectory $AppDir
 Write-Host ""
 Write-Host "   Done!  Hover the island at the top of the screen, right-click the Dock for options." -ForegroundColor Green
 Write-Host "   Shortcuts:  Alt+Shift+Space = Apps,  Alt+Shift+C = Control Center" -ForegroundColor DarkGray

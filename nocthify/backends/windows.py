@@ -246,6 +246,59 @@ def _release(ptr):
         ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[2])(ptr)
 
 
+class _Brightness:
+    """Built-in screen brightness through the power settings (what Windows' own slider
+    and the Fn keys change).  ~30 ms per change instead of ~600 ms for a PowerShell
+    + WMI round trip, and Windows' slider stays in sync."""
+
+    def __init__(self):
+        self.pp = ctypes.WinDLL("powrprof")
+        self.sub = _guid("{7516b95f-f776-4464-8c53-06167f40cc99}")      # GUID_VIDEO_SUBGROUP
+        self.key = _guid("{aded5e82-b909-4619-9949-f5d71dac0bcb}")      # display brightness
+        self.panel = None                                               # unknown until WMI says
+
+    @staticmethod
+    def _on_ac():
+        class SPS(ctypes.Structure):
+            _fields_ = [("ac", ctypes.c_ubyte), ("flag", ctypes.c_ubyte), ("pct", ctypes.c_ubyte),
+                        ("r", ctypes.c_ubyte), ("life", wt.DWORD), ("full", wt.DWORD)]
+        st = SPS()
+        if not kernel32.GetSystemPowerStatus(ctypes.byref(st)):
+            return True
+        return st.ac != 0                     # 1 = plugged in, 255 = unknown (desktop)
+
+    def _scheme(self):
+        scheme = ctypes.POINTER(_GUID)()
+        if self.pp.PowerGetActiveScheme(None, ctypes.byref(scheme)) != 0:
+            return None
+        return scheme
+
+    def get(self):
+        scheme = self._scheme()
+        if scheme is None:
+            return None
+        try:
+            val = wt.DWORD()
+            fn = self.pp.PowerReadACValueIndex if self._on_ac() else self.pp.PowerReadDCValueIndex
+            if fn(None, scheme, ctypes.byref(self.sub), ctypes.byref(self.key), ctypes.byref(val)) != 0:
+                return None
+            return int(val.value)
+        finally:
+            kernel32.LocalFree(scheme)
+
+    def set(self, level):
+        scheme = self._scheme()
+        if scheme is None:
+            return False
+        try:
+            fn = self.pp.PowerWriteACValueIndex if self._on_ac() else self.pp.PowerWriteDCValueIndex
+            if fn(None, scheme, ctypes.byref(self.sub), ctypes.byref(self.key), int(level)) != 0:
+                return False
+            return self.pp.PowerSetActiveScheme(None, scheme) == 0     # applies it right away
+        finally:
+            kernel32.LocalFree(scheme)
+
+
 class _Audio:
     def __init__(self):
         self.ok = False
@@ -345,6 +398,7 @@ class WindowsBackend(Backend):
         self._icon_cache = {}
         self._imagelists = None
         self._audio = None
+        self._bright = None
         self._own_pid = os.getpid()
         self._taskbar_hidden = False
         self._peek_until = 0.0
@@ -857,7 +911,15 @@ class WindowsBackend(Backend):
             self._audio = _Audio()
         self._audio.set(mute=mute)
 
-    def get_brightness(self):
+    def _brightness(self):
+        if self._bright is None:
+            try:
+                self._bright = _Brightness()
+            except OSError:
+                self._bright = False
+        return self._bright or None
+
+    def _wmi_brightness(self):
         out = _powershell("(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightness "
                           "-ErrorAction SilentlyContinue | Select-Object -First 1).CurrentBrightness")
         try:
@@ -865,8 +927,26 @@ class WindowsBackend(Backend):
         except (ValueError, IndexError):
             return None
 
+    def get_brightness(self):
+        b = self._brightness()
+        if b is not None and b.panel is None:
+            # one slow check, once: does this PC have a built-in screen with adjustable brightness?
+            b.panel = self._wmi_brightness() is not None
+        if b is not None and b.panel:
+            val = b.get()
+            if val is not None:
+                return val
+            return self._wmi_brightness()
+        return None if b is not None else self._wmi_brightness()
+
     def set_brightness(self, level: int):
         level = max(0, min(100, int(level)))
+        b = self._brightness()
+        try:
+            if b is not None and b.set(level):
+                return
+        except OSError:
+            pass
         _powershell("$m = Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods "
                     f"-ErrorAction SilentlyContinue; if ($m) {{ $m | ForEach-Object {{ "
                     f"$_.WmiSetBrightness(1, {level}) }} }}")

@@ -15,7 +15,7 @@ import os
 import sys
 import time
 
-from PyQt5.QtCore import QDate, QLocale, QPoint, QPointF, QRectF, Qt, QTimer
+from PyQt5.QtCore import QDate, QLocale, QPoint, QPointF, QRect, QRectF, Qt, QTimer
 from PyQt5.QtGui import QColor, QFont, QFontMetricsF, QLinearGradient, QPainter, QRegion
 from PyQt5.QtWidgets import QApplication, QMenu, QWidget
 
@@ -73,6 +73,8 @@ class Dock(QWidget):
         self.menu_open = False
         self._icons = {}
         self._frame = QTimer(self, interval=16, timeout=self._step)
+        self._full = True            # window tall enough for magnified icons / labels / bounces
+        self._geo = None             # (full QRect, compact QRect)
         self._autohide_timer = QTimer(self, singleShot=True, timeout=self._maybe_hide)
 
         hub.windows_changed.connect(self._on_windows)
@@ -452,16 +454,43 @@ class Dock(QWidget):
             base_total = main_screen * 0.94
         extra = (self.mag - self.base) * 3.2
         length = int(min(main_screen, base_total + extra + 220))
-        cross = int(self.em + self.pad() + self.mag + 52)
-        if self.pos_kind == "bottom":
-            self.setFixedSize(length, cross)
-            self.move(g.x() + (g.width() - length) // 2, g.y() + g.height() - cross)
-        elif self.pos_kind == "left":
-            self.setFixedSize(cross, length)
-            self.move(g.x(), g.y() + (g.height() - length) // 2)
-        else:
-            self.setFixedSize(cross, length)
-            self.move(g.x() + g.width() - cross, g.y() + (g.height() - length) // 2)
+        full = int(self.em + self.pad() + self.mag + 52)
+        # at rest only the pill is visible: a window just that tall costs less memory and
+        # less to repaint; it grows the moment the cursor touches the dock
+        compact = min(full, int(math.ceil(self.em + self.thick() + 8)))
+        geo = []
+        for cross in (full, compact):
+            if self.pos_kind == "bottom":
+                geo.append(QRect(g.x() + (g.width() - length) // 2, g.y() + g.height() - cross, length, cross))
+            elif self.pos_kind == "left":
+                geo.append(QRect(g.x(), g.y() + (g.height() - length) // 2, cross, length))
+            else:
+                geo.append(QRect(g.x() + g.width() - cross, g.y() + (g.height() - length) // 2, cross, length))
+        self._geo = tuple(geo)
+        self._full = None
+        self._fit()
+
+    def _needs_full(self):
+        return (self.mouse is not None or self.drag is not None or self.menu_open
+                or self.hover > 0.001 or self.hover_target > 0
+                or any(time.time() - i.bounce_t0 < 1.5 for i in self.items))
+
+    def _fit(self, repaint=False):
+        """Switch between the full and the compact window (both share the screen edge)."""
+        if not self._geo:
+            return
+        full = bool(self._needs_full() or not self.hub.config.get("general", "low_memory"))
+        if full == self._full:
+            return
+        self._full = full
+        r = self._geo[0 if full else 1]
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(16777215, 16777215)
+        self.setGeometry(r)
+        self.setFixedSize(r.size())
+        self._update_mask()
+        if repaint and self.isVisible():
+            self.repaint()          # paint at the new size before the screen is composed again
 
     def _main_len(self):
         return self.width() if self.pos_kind == "bottom" else self.height()
@@ -533,6 +562,7 @@ class Dock(QWidget):
 
     # ------------------------------------------------------------ animation
     def _kick(self):
+        self._fit(repaint=True)
         if not self._frame.isActive():
             self._frame.start()
 
@@ -557,6 +587,8 @@ class Dock(QWidget):
             self._frame.stop()
         self._update_mask()
         self.update()
+        if not busy:
+            self._fit()
 
     def _update_mask(self):
         if not IS_LINUX:
@@ -783,6 +815,7 @@ class Dock(QWidget):
             m.addSeparator()
             m.addAction("Quit Nocthify", lambda: self.hub.do("quit"))
         self.menu_open = True
+        self._fit(repaint=True)
         m.exec_(gpos)
         self.menu_open = False
         self.press = None

@@ -90,6 +90,7 @@ class Hub(QObject):
         self._watcher_tried = False
         self._t_trim = QTimer(self, singleShot=True, timeout=self._trim)
         self._t_trim_idle = self._timer(30000, lambda: self.schedule_trim(0))
+        self._frozen = not hasattr(__import__("gc"), "freeze")   # gc.freeze: Python 3.7+
         self.busy_checks = []             # callables -> True while UI is animating / hovered
         self.refresh_palette(emit=False)
 
@@ -257,6 +258,11 @@ class Hub(QObject):
             return
         import gc
         gc.collect()
+        if not self._frozen:
+            # everything alive after start-up lives until exit: park it where the garbage
+            # collector never walks it again, so its pages can stay out of RAM
+            gc.freeze()
+            self._frozen = True
         self.backend.trim_memory()
 
     def _merge_media(self):

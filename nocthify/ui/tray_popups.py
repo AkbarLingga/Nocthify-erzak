@@ -18,7 +18,7 @@ class VolumePopup(GlassPopup):
     def __init__(self, hub):
         super().__init__(hub)
         m = self.margin
-        self._apply_timer = QTimer(self, singleShot=True, interval=40, timeout=self._apply)
+        self._apply_timer = QTimer(self, singleShot=True, interval=16, timeout=self._apply)
         root = QVBoxLayout(self)
         root.setContentsMargins(m + 14, m + 12, m + 14, m + 12)
         root.setSpacing(8)
@@ -39,7 +39,7 @@ class VolumePopup(GlassPopup):
         b_mute.clicked.connect(self._toggle_mute)
         foot.addWidget(b_mute)
         root.addLayout(foot)
-        self.slider.valueChanged.connect(lambda _v: (self._apply_timer.start(), self._label()))
+        self.slider.valueChanged.connect(lambda _v: (self._apply_timer.isActive() or self._apply_timer.start(), self._label()))
         self.slider.iconClicked.connect(self._toggle_mute)
         hub.volume_changed.connect(self._on_volume)
         self.setFixedWidth(self.WIDTH + 2 * m)

@@ -102,8 +102,8 @@ class ControlCenter(GlassPopup):
 
     def __init__(self, hub):
         super().__init__(hub)
-        self._bright_timer = QTimer(self, singleShot=True, interval=220, timeout=self._apply_brightness)
-        self._vol_timer = QTimer(self, singleShot=True, interval=40, timeout=self._apply_volume)
+        self._bright_timer = QTimer(self, singleShot=True, interval=16, timeout=self._apply_brightness)
+        self._vol_timer = QTimer(self, singleShot=True, interval=16, timeout=self._apply_volume)
         self._build()
         hub.volume_changed.connect(self._on_volume)
         hub.config.changed.connect(lambda _s: self._sync_toggles())
@@ -166,8 +166,9 @@ class ControlCenter(GlassPopup):
         self.t_bt.clicked.connect(lambda: self._run("bluetooth"))
         self.t_dnd.clicked.connect(lambda: self.hub.do("dnd"))
         self.t_dark.clicked.connect(self._toggle_dark)
-        self.s_bright.valueChanged.connect(lambda _v: self._bright_timer.start())
-        self.s_vol.valueChanged.connect(lambda _v: self._vol_timer.start())
+        # throttle, not debounce: apply while dragging (every ~16 ms), and the last value always lands
+        self.s_bright.valueChanged.connect(lambda _v: self._bright_timer.isActive() or self._bright_timer.start())
+        self.s_vol.valueChanged.connect(lambda _v: self._vol_timer.isActive() or self._vol_timer.start())
         self.s_vol.iconClicked.connect(self._toggle_mute)
         self.setFixedWidth(self.WIDTH + 2 * m)
 
@@ -194,8 +195,7 @@ class ControlCenter(GlassPopup):
         self.s_vol.set_glyph("volume" if self.s_vol.value else "volume_mute")
 
     def _apply_brightness(self):
-        val = self.s_bright.value
-        self.hub.run_async(lambda: self.hub.backend.set_brightness(val))
+        self.hub.backend.set_brightness_async(self.s_bright.value)
 
     def _on_volume(self, level, muted):
         if not self.s_vol._drag:

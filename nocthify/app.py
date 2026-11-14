@@ -148,6 +148,8 @@ class NocthifyApp:
         self._tray()
         self._hotkeys()
         self._autostart()
+        if IS_WIN:
+            QTimer.singleShot(20000, self._ensure_exe)
         self.config.changed.connect(self.on_config)
         self.qapp.setStyleSheet(menu_stylesheet(self.hub.palette))
         self.hub.theme_changed.connect(self._on_theme)
@@ -217,12 +219,25 @@ class NocthifyApp:
         elif kind == "taskbar":
             self.backend.taskbar_watchdog()
 
+    def _ensure_exe(self):
+        """Keep Nocthify.exe (shows as "Nocthify" in Task Manager) built and up to date."""
+        try:
+            from .winexe import ensure_exe
+            if ensure_exe():
+                self._autostart()
+        except Exception:
+            log.exception("Nocthify.exe")
+
     def _autostart(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         script = os.path.join(root, "run.pyw")
         exe = sys.executable
         if IS_WIN:
+            from .winexe import exe_path
+            own = exe_path()
             pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+            if own and os.path.exists(own):
+                pyw = own
             cmd = f'"{pyw if os.path.exists(pyw) else exe}" "{script}"'
         else:
             cmd = f'"{exe}" "{script}"'
@@ -343,8 +358,75 @@ def _send_to_running(cmd: str) -> bool:
     return True
 
 
+_instance_lock = None
+
+
+def _acquire_instance(cmd: str) -> bool:
+    """Make sure only one Nocthify ever runs (two docks / islands on top of each other).
+
+    A second start while another copy is still starting up or shutting down waits for
+    it (up to 6 s): if that copy turns out to be running, the command is handed to it.
+    """
+    global _instance_lock
+    import time
+    deadline = time.monotonic() + 6.0
+    if IS_WIN:
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        k32.WaitForSingleObject.restype = ctypes.c_uint32
+        h = k32.CreateMutexW(None, True, "Local\\Nocthify-erzak-single-instance")
+        if not h:
+            return True
+        _instance_lock = h
+        if ctypes.get_last_error() != 183:            # ERROR_ALREADY_EXISTS: someone else has it
+            return True
+        while time.monotonic() < deadline:
+            if k32.WaitForSingleObject(h, 250) in (0, 0x80):   # it exited (or crashed): ours now
+                return True
+            if _send_to_running(cmd):
+                return False
+        return False
+    try:
+        import fcntl
+        fh = open(os.path.join(config_dir(), ".instance.lock"), "w")
+    except (ImportError, OSError):
+        return True
+    _instance_lock = fh
+    while True:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if _send_to_running(cmd) or time.monotonic() > deadline:
+                return False
+            time.sleep(0.25)
+
+
 def main(argv=None):
     argv = list(sys.argv if argv is None else argv)
+    if sys.platform.startswith("linux"):
+        try:  # show up as "nocthify" (not "python3") in top / System Monitor
+            import ctypes
+            ctypes.CDLL(None).prctl(15, b"nocthify", 0, 0, 0)
+        except Exception:
+            pass
+    if "--make-exe" in argv:
+        # installer step (Windows): build Nocthify.exe
+        from PyQt5.QtGui import QGuiApplication
+        gapp = QGuiApplication(argv[:1])  # noqa: F841 - the icon is drawn with Qt
+        from .winexe import ensure_exe
+        try:
+            path = ensure_exe()
+        except Exception as e:
+            path = None
+            if sys.stdout is not None:
+                print(f"Could not build Nocthify.exe: {e}")
+        if sys.stdout is not None and path:
+            print(path)
+        return 0
     if "--restore-taskbar" in argv:
         # Emergency switch: quit a running copy, bring the taskbar back and keep it.
         core = QCoreApplication(argv)  # noqa: F841 - Qt objects need an app instance
@@ -374,6 +456,8 @@ def main(argv=None):
     if _send_to_running(cmd):
         return 0
     if cmd == "quit":
+        return 0
+    if not _acquire_instance(cmd):
         return 0
 
     QLocalServer.removeServer(SERVER_NAME)

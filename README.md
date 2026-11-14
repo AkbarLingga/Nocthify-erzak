@@ -112,7 +112,8 @@ Ikon tray (Wi-Fi, volume, dll.) tetap bisa dibuka lewat klik kanan dock → **Sh
 ## ⚡ Performa
 - Semua UI digambar sendiri di atas 3 jendela transparan. Tidak ada browser engine (bukan Electron).
 - Tidak ada timer animasi yang jalan saat diam. CPU & RAM hanya dibaca saat panel yang menampilkannya terbuka.
-- RAM di Task Manager **±7–10 MB** saat diam (mode Hemat RAM, bisa dimatikan di Settings). Startup < 1 detik.
+- RAM di Task Manager **±7–9 MB** saat diam (mode Hemat RAM, bisa dimatikan di Settings). Startup < 1 detik.
+- Di Task Manager muncul sebagai **Nocthify** (satu proses, pakai ikon sendiri), bukan "Python".
 - **Event-driven**: Windows yang mengabari saat jendela/lagu/volume berubah, jadi tidak ada polling terus-menerus. CPU ±0,1–0,3% saat musik diputar.
 - Tanpa pywin32/comtypes: semua akses Windows lewat `ctypes` langsung.
 

@@ -157,6 +157,31 @@ class Backend:
     def set_brightness(self, level: int):
         pass
 
+    def set_brightness_async(self, level: int):
+        """Apply brightness off the UI thread; while one change is being applied only the
+        newest requested level is kept, so dragging a slider never queues up a backlog."""
+        import threading
+        lock = self.__dict__.setdefault("_bright_lock", threading.Lock())
+        with lock:
+            self._bright_want = int(level)
+            if getattr(self, "_bright_busy", False):
+                return
+            self._bright_busy = True
+
+        def worker():
+            while True:
+                with lock:
+                    level = self._bright_want
+                    self._bright_want = None
+                    if level is None:
+                        self._bright_busy = False
+                        return
+                try:
+                    self.set_brightness(level)
+                except Exception:
+                    pass
+        threading.Thread(target=worker, name="nocthify-brightness", daemon=True).start()
+
     def media_info(self, windows: list):
         """Return dict(title, artist, source) or None."""
         return None
