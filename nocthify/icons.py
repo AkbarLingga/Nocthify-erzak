@@ -83,6 +83,8 @@ GLYPHS = {
     "keyboard": (0, '<rect x="2" y="5" width="20" height="14" rx="2.5"/><path d="M6 9h.01M10 9h.01M14 9h.01'
                     'M18 9h.01M6 13h.01M18 13h.01M10 13h4M7 16.5h10"/>'),
     "tasks": (0, '<path d="M3 12h4l3-8 4 16 3-8h4"/>'),
+    "lyrics": (0, '<path d="M4.5 4.5h15a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H10l-4.5 3.5v-3.5h-1a1 1 0 0 1-1-1v-10a1 1 0 0 1 1-1z"/>'
+                  '<path d="M8 9h8M8 12.5h5"/>'),
     "chevron_up": (0, '<path d="m6 15 6-6 6 6"/>'),
     "chevron_left": (0, '<path d="m15 6-6 6 6 6"/>'),
     "chevron_right": (0, '<path d="m9 6 6 6-6 6"/>'),

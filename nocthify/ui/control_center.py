@@ -21,14 +21,14 @@ class MediaCard(QWidget):
         lay.addStretch(1)
         for glyph, cmd in (("prev", "prev"), ("play", "play"), ("next", "next")):
             b = RoundButton(glyph, 32, flat=True)
-            b.clicked.connect(lambda c=cmd: hub.backend.media(c))
+            b.clicked.connect(lambda c=cmd: hub.media_command(c))
             lay.addWidget(b)
             if cmd == "play":
                 self.play_btn = b
         hub.media_changed.connect(self._on_media)
 
     def _on_media(self, media):
-        self.play_btn.set_glyph("pause" if media else "play")
+        self.play_btn.set_glyph("pause" if media and media.get("playing", True) else "play")
         self.update()
 
     def paintEvent(self, _e):

@@ -895,6 +895,19 @@ class WindowsBackend(Backend):
                                 "app_id": w.app_id}
         return None
 
+    def open_media(self, media: dict, windows: list) -> bool:
+        if super().open_media(media, windows):
+            return True
+        exe = (media.get("exe") or "").lower()
+        for w in windows:
+            if exe and os.path.basename(w.exe or "").lower() == exe:
+                self.activate(w.id)
+                return True
+        if "spotify" in exe or (media.get("source") or "").lower() == "spotify":
+            return _startfile("spotify:")          # Spotify hidden in the tray: this brings it back
+        app = media.get("app_id") or ""
+        return self.launch(app) if app and os.path.isfile(app) else False
+
     def media(self, cmd: str):
         vk = {"play": VK_MEDIA_PLAY, "next": VK_MEDIA_NEXT, "prev": VK_MEDIA_PREV}.get(cmd)
         if vk:

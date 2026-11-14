@@ -1,2 +1,8 @@
 PyQt5>=5.15,<5.16
 psutil>=5.9
+# Windows 10/11: now-playing info with play/pause state and position (for synced lyrics).
+# Optional - Nocthify falls back to reading window titles without it.
+winrt-runtime; sys_platform == "win32" and python_version >= "3.9"
+winrt-Windows.Foundation; sys_platform == "win32" and python_version >= "3.9"
+winrt-Windows.Foundation.Collections; sys_platform == "win32" and python_version >= "3.9"
+winrt-Windows.Media.Control; sys_platform == "win32" and python_version >= "3.9"

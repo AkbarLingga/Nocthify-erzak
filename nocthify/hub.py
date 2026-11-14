@@ -7,6 +7,7 @@ them is open.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 
@@ -35,6 +36,14 @@ SHORTCUTS = {
 }
 
 
+BROWSERS = {"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe", "vivaldi.exe",
+            "arc.exe", "zen.exe", "librewolf.exe", "waterfox.exe", "yandex.exe", "iexplore.exe"}
+
+
+def song_key(media) -> str:
+    return f"{(media or {}).get('artist', '')}|{(media or {}).get('title', '')}".lower()
+
+
 class Hub(QObject):
     windows_changed = pyqtSignal(list)
     media_changed = pyqtSignal(object)
@@ -46,6 +55,8 @@ class Hub(QObject):
     activity = pyqtSignal(dict)
     timer_tick = pyqtSignal(object)      # remaining seconds or None
     network_changed = pyqtSignal(object)  # ("wifi", ssid) | ("ethernet", "") | ("none", "")
+    lyrics_ready = pyqtSignal(str, object)  # song key, lyrics result
+    _media_raw = pyqtSignal(object)         # from the media watcher thread
     _async_done = pyqtSignal(object, object)
 
     def __init__(self, config, backend):
@@ -59,6 +70,11 @@ class Hub(QObject):
         self.stats = (0.0, 0.0)
         self.fullscreen = False
         self.network = None
+        self.media_pos = None                # (position s, monotonic sampled, duration s, playing)
+        self._media_title = None             # title-based detection (fallback)
+        self._media_sys = None               # Windows media session info (preferred)
+        self._exe_by_name = {}
+        self._lyrics = None
         self.dock = None                     # set by the app; popups anchor to it
         self.timer_end = None
         self.cc_open = False
@@ -69,6 +85,16 @@ class Hub(QObject):
         self._dark = None
         self.palette = None
         self._async_done.connect(lambda cb, res: cb(res) if cb else None)
+        self._media_raw.connect(self._on_media_session)
+        self.media_watcher = None
+        if backend.name == "windows":
+            try:
+                from .backends.media_win import MediaWatcher
+                watcher = MediaWatcher(self._media_raw.emit)
+                if watcher.start():
+                    self.media_watcher = watcher
+            except Exception:
+                self.media_watcher = None
         self.refresh_palette(emit=False)
 
         linux = backend.name == "linux"
@@ -140,7 +166,8 @@ class Hub(QObject):
             self.windows = wins
             self.windows_changed.emit(wins)
             if not self._t_media:
-                self._update_media(self.backend.media_info(wins))
+                self._media_title = self.backend.media_info(wins)
+                self._merge_media()
         if self.config.get("general", "hide_in_fullscreen"):
             try:
                 fs = self.backend.is_fullscreen_foreground()
@@ -155,10 +182,116 @@ class Hub(QObject):
     def _poll_media(self):
         self.run_async(lambda: self.backend.media_info(self.windows), self._update_media)
 
+    # ----------------------------------------------------------------- media
     def _update_media(self, info):
+        """Linux / generic path: one dict, possibly with position & duration."""
+        if info:
+            info = dict(info)
+            pos, dur = info.pop("position", None), info.pop("duration", None)
+            if pos is not None:
+                self.media_pos = (float(pos), time.monotonic(), float(dur or 0), info.get("playing", True))
+        self._set_media(info)
+
+    def _set_media(self, info):
         if info != self.media:
             self.media = info
             self.media_changed.emit(info)
+
+    def _on_media_session(self, info):
+        if info:
+            self.media_pos = (info["position"], info["sampled"], info["duration"], info["playing"])
+        self._media_sys = info
+        self._merge_media()
+
+    def _merge_media(self):
+        sys_info = self._media_sys
+        if not sys_info:
+            self._set_media(self._media_title)
+            return
+        w = self._media_window(sys_info)
+        aumid = sys_info["aumid"]
+        exe = os.path.basename(w.exe) if w is not None and w.exe else aumid
+        app_id = w.app_id if w is not None else self._exe_path(aumid)
+        video = exe.lower() in BROWSERS
+        source = "Spotify" if "spotify" in exe.lower() else self.backend.app_name(app_id or exe)
+        self._set_media({"title": sys_info["title"], "artist": sys_info["artist"],
+                         "album": sys_info["album"], "source": source, "app_id": app_id or "",
+                         "exe": exe, "wid": w.id if w is not None else None,
+                         "playing": sys_info["playing"], "video": video})
+
+    def _media_window(self, info):
+        aumid = info["aumid"].lower()
+        stem = aumid[:-4] if aumid.endswith(".exe") else aumid
+        title = info["title"].lower()
+        by_exe = [w for w in self.windows if stem and stem in os.path.basename(w.exe or "").lower()]
+        by_title = [w for w in self.windows if title and title in (w.title or "").lower()]
+        for w in by_title:
+            if not by_exe or w in by_exe:
+                return w
+        if by_exe:
+            return by_exe[0]
+        return by_title[0] if by_title else None
+
+    def _exe_path(self, aumid):
+        """'Spotify.exe' -> full path of the running process (for its icon), cached."""
+        name = (aumid or "").lower()
+        if not name.endswith(".exe"):
+            return ""
+        if name not in self._exe_by_name:
+            path = ""
+            try:
+                import psutil
+                for proc in psutil.process_iter(["name", "exe"]):
+                    if (proc.info.get("name") or "").lower() == name and proc.info.get("exe"):
+                        path = proc.info["exe"]
+                        break
+            except Exception:
+                path = ""
+            self._exe_by_name[name] = path
+        return self._exe_by_name[name]
+
+    def media_position(self):
+        """Current playback position in seconds (extrapolated), or None."""
+        mp = self.media_pos
+        if not mp or not self.media:
+            return None
+        pos, at, dur, playing = mp
+        if playing:
+            pos += time.monotonic() - at
+        return min(pos, dur) if dur else pos
+
+    def media_duration(self):
+        mp = self.media_pos
+        return mp[2] if mp else 0.0
+
+    def media_command(self, cmd):
+        if self.media_watcher is not None and self.media_watcher.command(cmd):
+            return
+        self.backend.media(cmd)
+
+    def open_media(self):
+        """Bring up whatever is playing: the Spotify app, or the browser window with the song."""
+        m = self.media
+        if not m:
+            return
+        try:
+            self.backend.open_media(m, self.windows)
+        except Exception:
+            pass
+
+    def request_lyrics(self, media):
+        """Fetch lyrics off-thread; answers through lyrics_ready(key, result)."""
+        if not media:
+            return
+        key = song_key(media)
+        if self._lyrics is None:
+            from .config import config_dir
+            from .lyrics import LyricsStore
+            self._lyrics = LyricsStore(os.path.join(config_dir(), "lyrics"))
+        store, dur = self._lyrics, self.media_duration()
+        args = (media.get("title", ""), media.get("artist", ""), media.get("album", ""), dur,
+                bool(media.get("video")))
+        self.run_async(lambda: store.fetch(*args), lambda res: self.lyrics_ready.emit(key, res))
 
     def _poll_volume(self):
         v = self.backend.get_volume()
@@ -258,6 +391,8 @@ class Hub(QObject):
             return
         if name == "timer":
             self.toggle_timer()
+        elif name == "media_open":
+            self.open_media()
         elif name == "dark_mode":
             dark = not self.backend.is_dark_mode()
             self.backend.set_dark_mode(dark)

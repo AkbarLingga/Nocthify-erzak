@@ -67,6 +67,7 @@ DEFAULTS = {
         "show_media": True,
         "show_stats": True,
         "volume_hud": True,
+        "lyrics": True,             # hold the music in the island for synced lyrics (lrclib.net)
         "timer_minutes": 5,
         "shortcuts": ["files", "browser", "terminal", "screenshot",
                       "calculator", "timer", "launcher", "control_center"],

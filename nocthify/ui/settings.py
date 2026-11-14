@@ -340,6 +340,8 @@ class SettingsWindow(QWidget):
         self._bool(cv, "island", "show_clock", "Clock")
         self._bool(cv, "island", "show_battery", "Battery")
         self._bool(cv, "island", "show_media", "Now playing", "Spotify, YouTube, VLC… (playerctl on Linux)")
+        self._bool(cv, "island", "lyrics", "Lyrics",
+                   "Hold the music to show time-synced lyrics. Song title & artist are looked up on lrclib.net")
         self._bool(cv, "island", "show_stats", "CPU & RAM rings")
         cv = self._card(v, "Shortcuts in the island (tick, then order)")
         cv.addWidget(self._shortcut_editor())

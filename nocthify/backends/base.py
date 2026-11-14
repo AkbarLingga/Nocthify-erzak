@@ -165,6 +165,23 @@ class Backend:
         """cmd: play | next | prev"""
         pass
 
+    def open_media(self, media: dict, windows: list) -> bool:
+        """Bring the player of `media` to the front (app window or the browser tab's window)."""
+        title = (media.get("title") or "").lower()
+        wid = media.get("wid")
+        target = None
+        if wid is not None and any(w.id == wid for w in windows):
+            target = wid
+        else:
+            for w in windows:
+                if title and title in (w.title or "").lower():
+                    target = w.id
+                    break
+        if target is not None:
+            self.activate(target)
+            return True
+        return False
+
     # ---------------------------------------------------- quick actions
     def action(self, name: str) -> bool:
         return False

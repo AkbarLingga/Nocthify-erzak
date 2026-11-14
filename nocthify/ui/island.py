@@ -5,6 +5,10 @@ States
   activity  - temporary wider pill: volume HUD, charging, low battery, alerts
   expanded  - big card on hover: clock + date, battery/CPU/RAM rings,
               now-playing with media controls, and a row of shortcuts
+  lyrics    - time-synced lyrics of the song that is playing (hold the music to toggle);
+              while lyrics are on, the compact pill shows the current line
+
+Music: click = open the player (Spotify app / the browser window), hold = lyrics.
 
 The whole island is painted by hand on one translucent window, so it costs
 almost nothing while idle (no timers run unless something is animating).
@@ -26,6 +30,10 @@ from ..theme import (elide, font, menu_stylesheet, notch_path, paint_glass, pain
 
 IS_LINUX = not sys.platform.startswith("win")
 M = 22  # transparent margin around the island for the shadow
+LH = 236  # height of the lyrics view
+LYRIC_PILL = 430  # width of the compact pill while it shows lyrics
+HOLD_MS = 420
+HOLD_ZONES = ("c_music", "m_open", "l_open")
 
 
 class Island(QWidget):
@@ -55,6 +63,18 @@ class Island(QWidget):
         self._art_key = None
         self._stats_on = False
         self.timer_left = None
+        # lyrics
+        self.lyrics_on = False
+        self.lyr = None              # {"synced": [(t, line)]} | {"plain": [...]} | {"miss"} | ...
+        self.lyr_state = "idle"      # idle | loading | ready | offline
+        self.lyr_key = None
+        self.lyr_idx = -1
+        self.lyr_scroll = 0.0
+        self.lyr_prev_line = ""
+        self.lyr_changed_at = 0.0
+        self.lyr_manual = None       # manual scroll offset for unsynced lyrics
+        self._press = None           # (zone id, callback) waiting for click-vs-hold
+        self._held = False
 
         self.anim = QVariantAnimation(self)
         self.anim.valueChanged.connect(self._on_shape)
@@ -63,6 +83,9 @@ class Island(QWidget):
         self.t_activity = QTimer(self, singleShot=True, timeout=self._end_activity)
         self.t_clock = QTimer(self, interval=1000, timeout=self._tick)
         self.t_bars = QTimer(self, interval=95, timeout=self._animate_bars)
+        self.t_hold = QTimer(self, singleShot=True, timeout=self._on_hold)
+        self.t_lyr = QTimer(self, interval=120, timeout=self._lyr_tick)
+        self.t_lyr_anim = QTimer(self, interval=16, timeout=self._lyr_animate)
 
         hub.battery_changed.connect(lambda _b: self.update())
         hub.media_changed.connect(self._on_media)
@@ -71,6 +94,7 @@ class Island(QWidget):
         hub.theme_changed.connect(self.update)
         hub.timer_tick.connect(self._on_timer)
         hub.fullscreen_changed.connect(self._on_fullscreen)
+        hub.lyrics_ready.connect(self._on_lyrics)
         self.reload()
         self.t_clock.start()
 
@@ -109,7 +133,7 @@ class Island(QWidget):
         # On Linux keep clear of top panels (GNOME top bar etc.)
         screen = scr.availableGeometry() if IS_LINUX else scr.geometry()
         w = self.ew + 2 * M
-        h = self.top + self.eh + M
+        h = self.top + max(self.eh, LH) + M
         self.setFixedSize(w, h)
         self.move(screen.x() + (screen.width() - w) // 2, screen.y())
         self.shape = self._target("compact")
@@ -145,15 +169,23 @@ class Island(QWidget):
         return h + 10
 
     def _compact_width(self):
+        if self._lyric_pill():
+            return max(self.cw + 46, LYRIC_PILL)
         w = self.cw
         if (self.hub.media and self.c.get("show_media", True)) or self.timer_left:
             w += 46
         return w
 
+    def _lyric_pill(self):
+        return (self.lyrics_on and self.hub.media is not None and self.lyr_state == "ready"
+                and bool(self.lyr) and ("synced" in self.lyr or "plain" in self.lyr) and not self.timer_left)
+
     def _target(self, mode):
         cx = self.width() / 2
         if mode == "expanded":
             w, h = self.ew, self.eh
+        elif mode == "lyrics":
+            w, h = self.ew, LH
         elif mode == "activity":
             w, h = max(self.cw + 150, 340), self.ch + 12
         else:
@@ -180,10 +212,10 @@ class Island(QWidget):
             curve = QEasingCurve(QEasingCurve.OutBack)
             curve.setOvershoot(1.05 if mode == "expanded" else 1.4)
             self.anim.setEasingCurve(curve)
-            self.anim.setDuration(430 if mode == "expanded" else 360)
+            self.anim.setDuration(430 if mode in ("expanded", "lyrics") else 360)
         else:
             self.anim.setEasingCurve(QEasingCurve.OutCubic)
-            self.anim.setDuration(300 if prev == "expanded" else 260)
+            self.anim.setDuration(300 if prev in ("expanded", "lyrics") else 260)
         self.anim.start()
         self._sync_bars()
         want = mode == "expanded"
@@ -201,8 +233,9 @@ class Island(QWidget):
             self.setMask(QRegion(self.shape.adjusted(-2, -2, 2, 2).toAlignedRect()))
 
     def expand(self):
-        if self.mode != "expanded":
-            self._go("expanded")
+        target = "lyrics" if self.lyrics_on and self.hub.media else "expanded"
+        if self.mode != target:
+            self._go(target)
 
     def collapse(self):
         if self.activity and self.t_activity.isActive():
@@ -229,8 +262,12 @@ class Island(QWidget):
     # --------------------------------------------------------------- events
     def _on_media(self, info):
         self._sync_bars()
+        if self.lyrics_on:
+            self._load_lyrics()
         if self.mode == "compact":
             self._go("compact")
+        elif self.mode == "lyrics" and not info:
+            self._go("expanded")
         self.update()
 
     def _on_timer(self, remaining):
@@ -256,8 +293,10 @@ class Island(QWidget):
             self.update()
 
     def _sync_bars(self):
-        need = (self.hub.media is not None and self.mode == "compact" and self.isVisible()
-                and self.c.get("show_media", True) and self.cfg.get("general", "animations"))
+        media = self.hub.media
+        need = (media is not None and media.get("playing", True) and self.mode == "compact"
+                and self.isVisible() and self.c.get("show_media", True)
+                and self.cfg.get("general", "animations"))
         if need and not self.t_bars.isActive():
             self.t_bars.start()
         elif not need and self.t_bars.isActive():
@@ -298,7 +337,7 @@ class Island(QWidget):
     def _left(self):
         self.inside = False
         self.t_hover.stop()
-        if self.mode == "expanded":
+        if self.mode in ("expanded", "lyrics"):
             self.t_leave.start(380)
         if self.hover_zone:
             self.hover_zone = None
@@ -314,16 +353,43 @@ class Island(QWidget):
             return
         if e.button() != Qt.LeftButton:
             return
-        if self.mode == "expanded":
-            for rect, _zid, cb, _label in self.zones:
-                if rect.contains(pos):
+        for rect, zid, cb, _label in self.zones:
+            if rect.contains(pos):
+                if zid in HOLD_ZONES:          # click = open the player, hold = lyrics
+                    self._press = (zid, cb)
+                    self._held = False
+                    self.t_hover.stop()
+                    self.t_hold.start(HOLD_MS)
+                else:
                     cb()
-                    return
-        elif self.shape.contains(pos):
+                return
+        if self.mode == "compact" and self.shape.contains(pos):
             self.t_hover.stop()
             self.expand()
 
+    def mouseReleaseEvent(self, e):
+        if e.button() != Qt.LeftButton or self._press is None:
+            return
+        zid, cb = self._press
+        self._press = None
+        if self.t_hold.isActive():
+            self.t_hold.stop()
+            cb()
+
+    def _on_hold(self):
+        if self._press is not None:
+            self._press = None
+            self._held = True
+            self.toggle_lyrics()
+
     def wheelEvent(self, e):
+        if self.mode == "lyrics" and self.lyr and "plain" in self.lyr:
+            lines = self.lyr["plain"]
+            cur = self.lyr_manual if self.lyr_manual is not None else self.lyr_scroll
+            self.lyr_manual = max(0.0, min(len(lines) - 1.0, cur + (-2 if e.angleDelta().y() > 0 else 2)))
+            self.lyr_scroll = self.lyr_manual
+            self.update()
+            return
         v = self.hub.volume
         if v is None:
             v = self.hub.backend.get_volume()
@@ -345,6 +411,8 @@ class Island(QWidget):
         m.addAction("Control Center", lambda: self.hub.do("control_center"))
         m.addAction("Apps", lambda: self.hub.do("launcher"))
         m.addAction("Start / Cancel Timer", lambda: self.hub.do("timer"))
+        if self.hub.media and self.c.get("lyrics", True):
+            m.addAction("Hide Lyrics" if self.lyrics_on else "Show Lyrics", self.toggle_lyrics)
         m.addSeparator()
         style = m.addMenu("Style")
         style.setStyleSheet(menu_stylesheet(self.pal))
@@ -372,7 +440,11 @@ class Island(QWidget):
         span = max(1.0, self.eh - self.ch)
         grow = max(0.0, min(1.0, (r.height() - self.ch) / span))
         self.zones = []
-        if self.mode == "expanded" or grow > 0.35:
+        if self.mode == "lyrics":
+            lgrow = max(0.0, min(1.0, (r.height() - self.ch) / max(1.0, LH - self.ch)))
+            p.setOpacity(max(0.0, min(1.0, (lgrow - 0.35) / 0.5)))
+            self._paint_lyrics(p, r)
+        elif self.mode == "expanded" or grow > 0.35:
             p.setOpacity(max(0.0, min(1.0, (grow - 0.35) / 0.5)))
             self._paint_expanded(p, r)
         elif self.mode == "activity" and self.activity:
@@ -412,6 +484,9 @@ class Island(QWidget):
         fg = self.fg()
         pad = 15 if not self.notch else 18
         cy = r.center().y()
+        if self._lyric_pill():
+            self._paint_lyric_pill(p, r, pad)
+            return
         if self.c.get("show_clock", True):
             p.setPen(fg)
             p.setFont(font(13.5, QFont.DemiBold))
@@ -438,6 +513,8 @@ class Island(QWidget):
             art = self._media_art(18)
             if art is not None:
                 p.drawPixmap(QRectF(x - 28, cy - 9, 18, 18), art, QRectF(art.rect()))
+            self._zone(QRectF(x - 34, r.top(), r.right() - x + 34, r.height()), "c_music",
+                       self.hub.open_media, "Click: open  ·  Hold: lyrics")
             return
         b = self.hub.battery
         if b and self.c.get("show_battery", True):
@@ -572,7 +649,11 @@ class Island(QWidget):
             else:
                 icons.draw(p, "music", art.adjusted(11, 11, -11, -11), QColor("white"))
             tx = art.right() + 12
-            tw = card.right() - tx - 118
+            tw = card.right() - tx - 156
+            if media:
+                self._zone(QRectF(card.left(), card.top(), tw + tx - card.left(), card.height()), "m_open",
+                           self.hub.open_media, "Click: open " + (media.get("source") or "player") +
+                           "  ·  Hold: lyrics")
             p.setPen(fg)
             p.setFont(font(13, QFont.DemiBold))
             title = media.get("title") if media else "Not Playing"
@@ -581,17 +662,29 @@ class Island(QWidget):
             p.setPen(fg2)
             p.setFont(font(11.5))
             p.drawText(QRectF(tx, card.top() + 30, tw, 17), Qt.AlignLeft | Qt.AlignVCenter, elide(p, sub, tw))
-            bx = card.right() - 112
-            for glyph, cmd in (("prev", "prev"), ("play" if not media else "pause", "play"), ("next", "next")):
+            bx = card.right() - 150
+            playing = bool(media and media.get("playing", True))
+            buttons = [("prev", "prev"), ("pause" if playing else "play", "play"), ("next", "next")]
+            if media and self.c.get("lyrics", True):
+                buttons.append(("lyrics", "lyrics"))
+            else:
+                bx += 38
+            for glyph, cmd in buttons:
                 br = QRectF(bx, card.center().y() - 17, 34, 34)
-                hov = self._zone(br, "m_" + cmd, lambda c=cmd: self.hub.backend.media(c),
-                                 {"prev": "Previous", "play": "Play / Pause", "next": "Next"}[cmd])
-                if hov:
+                if cmd == "lyrics":
+                    hov = self._zone(br, "m_lyrics", self.toggle_lyrics,
+                                     "Hide lyrics" if self.lyrics_on else "Show lyrics")
+                else:
+                    hov = self._zone(br, "m_" + cmd, lambda c=cmd: self.hub.media_command(c),
+                                     {"prev": "Previous", "play": "Play / Pause", "next": "Next"}[cmd])
+                active = cmd == "lyrics" and self.lyrics_on
+                if hov or active:
                     p.setPen(Qt.NoPen)
-                    p.setBrush(self.tile(True))
+                    p.setBrush(self.pal.accent if active else self.tile(True))
                     p.drawEllipse(br)
                 s = 15 if cmd == "play" else 13
-                icons.draw(p, glyph, QRectF(br.center().x() - s / 2, br.center().y() - s / 2, s, s), fg)
+                icons.draw(p, glyph, QRectF(br.center().x() - s / 2, br.center().y() - s / 2, s, s),
+                           QColor("white") if active else fg)
                 bx += 38
             y += 60 + 12
 
@@ -624,12 +717,288 @@ class Island(QWidget):
             p.setFont(font(11, QFont.Medium))
             p.drawText(QRectF(x0, y - 4, x1 - x0, 18), Qt.AlignCenter, label)
 
+    # --------------------------------------------------------------- lyrics
+    def toggle_lyrics(self):
+        if not self.c.get("lyrics", True):
+            self.hub.notify("Lyrics are turned off in Settings", "music", kind="system")
+            return
+        if not self.hub.media and not self.lyrics_on:
+            self.hub.notify("Nothing is playing", "music", kind="system")
+            return
+        self.lyrics_on = not self.lyrics_on
+        if self.lyrics_on:
+            self._load_lyrics()
+            self.t_lyr.start()
+            self._go("lyrics")
+        else:
+            self.t_lyr.stop()
+            self.t_lyr_anim.stop()
+            self._go("expanded" if self.inside else "compact")
+        self.update()
+
+    def _load_lyrics(self):
+        media = self.hub.media
+        if not media:
+            return
+        from ..hub import song_key
+        key = song_key(media)
+        if key == self.lyr_key and self.lyr_state in ("loading", "ready"):
+            return
+        self.lyr_key = key
+        self.lyr = None
+        self.lyr_state = "loading"
+        self.lyr_idx = -1
+        self.lyr_scroll = 0.0
+        self.lyr_manual = None
+        self.lyr_prev_line = ""
+        self.hub.request_lyrics(media)
+        if self.mode == "compact":
+            self._go("compact")
+        self.update()
+
+    def _on_lyrics(self, key, res):
+        if key != self.lyr_key:
+            return
+        self.lyr = res
+        self.lyr_state = "offline" if res is None else "ready"
+        self.lyr_idx = -1
+        self._lyr_tick()
+        self.lyr_scroll = float(max(0, self.lyr_idx))
+        if self.mode == "compact":
+            self._go("compact")
+        self.update()
+
+    def _current_index(self):
+        lyr = self.lyr or {}
+        pos = self.hub.media_position()
+        if "synced" in lyr:
+            if pos is None:
+                return -1
+            pos += 0.25                                  # tiny lead: the line lights up as it's sung
+            lines = lyr["synced"]
+            lo, hi = 0, len(lines)
+            while lo < hi:                               # last line whose time <= pos
+                mid = (lo + hi) // 2
+                if lines[mid][0] <= pos:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            return lo - 1
+        if "plain" in lyr:
+            if self.lyr_manual is not None:
+                return int(self.lyr_manual)
+            dur = self.hub.media_duration()
+            if pos is not None and dur > 0:
+                return int(len(lyr["plain"]) * min(1.0, pos / dur))
+            return 0
+        return -1
+
+    def _lyr_tick(self):
+        if not self.lyrics_on:
+            self.t_lyr.stop()
+            return
+        if not self.isVisible() or self.lyr_state != "ready":
+            return
+        idx = self._current_index()
+        if idx != self.lyr_idx:
+            self.lyr_prev_line = self._line(self.lyr_idx)
+            self.lyr_idx = idx
+            self.lyr_changed_at = time.monotonic()
+            if not self.t_lyr_anim.isActive():
+                self.t_lyr_anim.start()
+        elif self.mode == "lyrics":
+            self.update()                                # progress bar
+
+    def _lyr_animate(self):
+        target = float(max(-1, self.lyr_idx))
+        if self.lyr_manual is not None:
+            target = self.lyr_manual
+        diff = target - self.lyr_scroll
+        fading = time.monotonic() - self.lyr_changed_at < 0.3
+        if abs(diff) < 0.004 and not fading:
+            self.lyr_scroll = target
+            self.t_lyr_anim.stop()
+        elif abs(diff) > 6:
+            self.lyr_scroll = target                     # big jump (seek): don't fly through the song
+        else:
+            self.lyr_scroll += diff * 0.18
+        self.update()
+
+    def _line(self, i):
+        lyr = self.lyr or {}
+        lines = lyr.get("synced") or [(0, ln) for ln in lyr.get("plain", [])]
+        if 0 <= i < len(lines):
+            return lines[i][1]
+        return ""
+
+    def _lyric_font(self, p, text, size, weight, max_w, min_size=11.0):
+        f = font(size, weight)
+        p.setFont(f)
+        while p.fontMetrics().horizontalAdvance(text) > max_w and size > min_size:
+            size -= 0.5
+            f = font(size, weight)
+            p.setFont(f)
+        return f
+
+    def _paint_lyric_pill(self, p, r, pad):
+        fg = self.fg()
+        cy = r.center().y()
+        art = self._media_art(18)
+        x = r.left() + pad
+        if art is not None:
+            p.drawPixmap(QRectF(x, cy - 9, 18, 18), art, QRectF(art.rect()))
+        col = self.pal.accent if not self.black() else QColor("#7CF29A")
+        bw, gap, h = 3.0, 2.6, r.height() * 0.5
+        bx = r.right() - pad - (4 * bw + 3 * gap)
+        p.setPen(Qt.NoPen)
+        p.setBrush(col)
+        for i, v in enumerate(self.bars):
+            bh = max(3.0, h * v)
+            p.drawRoundedRect(QRectF(bx + i * (bw + gap), cy - bh / 2, bw, bh), 1.5, 1.5)
+        text_r = QRectF(x + 28, r.top(), bx - x - 38, r.height())
+        line = self._line(self.lyr_idx) or ("\u266a" if "synced" in (self.lyr or {}) else "")
+        k = min(1.0, (time.monotonic() - self.lyr_changed_at) / 0.28)
+        if k < 1.0 and self.lyr_prev_line:              # old line slides up & fades, new one rises in
+            p.setOpacity(1.0 - k)
+            self._lyric_font(p, self.lyr_prev_line, 12.5, QFont.DemiBold, text_r.width())
+            p.setPen(fg)
+            p.drawText(text_r.translated(0, -8 * k), Qt.AlignCenter,
+                       elide(p, self.lyr_prev_line, text_r.width()))
+        p.setOpacity(k)
+        self._lyric_font(p, line, 12.5, QFont.DemiBold, text_r.width())
+        p.setPen(fg)
+        p.drawText(text_r.translated(0, 8 * (1 - k)), Qt.AlignCenter, elide(p, line, text_r.width()))
+        p.setOpacity(1.0)
+        self._zone(QRectF(r.left(), r.top(), r.width(), r.height()), "c_music", self.hub.open_media,
+                   "Click: open  ·  Hold: hide lyrics")
+
+    def _paint_lyrics(self, p, r):
+        fg, fg2 = self.fg(), self.fg2()
+        pad = 18
+        x0, x1 = r.left() + pad, r.right() - pad
+        top = r.top() + 14
+        media = self.hub.media or {}
+        # header: art, title/artist (click = open, hold = close lyrics), controls, close
+        art_r = QRectF(x0, top, 34, 34)
+        p.setPen(Qt.NoPen)
+        g = QLinearGradient(art_r.topLeft(), art_r.bottomRight())
+        g.setColorAt(0, self.pal.accent)
+        g.setColorAt(1, QColor("#BF5AF2"))
+        p.setBrush(g)
+        p.drawRoundedRect(art_r, 9, 9)
+        pm = self._media_art(34)
+        if pm is not None:
+            p.drawPixmap(art_r.adjusted(6, 6, -6, -6), pm, QRectF(pm.rect()))
+        else:
+            icons.draw(p, "music", art_r.adjusted(9, 9, -9, -9), QColor("white"))
+        bx = x1 - 4 * 32 + 2
+        tx = art_r.right() + 10
+        tw = bx - tx - 8
+        self._zone(QRectF(x0, top - 4, bx - x0 - 4, 42), "l_open", self.hub.open_media,
+                   "Click: open  ·  Hold: hide lyrics")
+        p.setPen(fg)
+        p.setFont(font(13, QFont.DemiBold))
+        p.drawText(QRectF(tx, top - 1, tw, 18), Qt.AlignLeft | Qt.AlignVCenter,
+                   elide(p, media.get("title", "Not Playing"), tw))
+        p.setPen(fg2)
+        p.setFont(font(11.5))
+        p.drawText(QRectF(tx, top + 17, tw, 17), Qt.AlignLeft | Qt.AlignVCenter,
+                   elide(p, media.get("artist") or media.get("source", ""), tw))
+        playing = bool(media.get("playing", True))
+        for glyph, zid, cb, label in (("prev", "l_prev", lambda: self.hub.media_command("prev"), "Previous"),
+                                      ("pause" if playing else "play", "l_play",
+                                       lambda: self.hub.media_command("play"), "Play / Pause"),
+                                      ("next", "l_next", lambda: self.hub.media_command("next"), "Next"),
+                                      ("close", "l_close", self.toggle_lyrics, "Hide lyrics")):
+            br = QRectF(bx, top + 2, 30, 30)
+            if self._zone(br, zid, cb, label):
+                p.setPen(Qt.NoPen)
+                p.setBrush(self.tile(True))
+                p.drawEllipse(br)
+            s = 13 if glyph != "close" else 12
+            icons.draw(p, glyph, QRectF(br.center().x() - s / 2, br.center().y() - s / 2, s, s), fg)
+            bx += 32
+        # body
+        body = QRectF(x0, top + 46, x1 - x0, r.bottom() - top - 46 - 40)
+        lyr = self.lyr or {}
+        msg = None
+        if not self.hub.media:
+            msg = "Nothing is playing"
+        elif self.lyr_state == "loading":
+            msg = "Loading lyrics\u2026"
+        elif self.lyr_state == "offline":
+            msg = "Can't reach lrclib.net right now"
+        elif lyr.get("instrumental"):
+            msg = "\u266a  Instrumental  \u266a"
+        elif lyr.get("miss") or not lyr:
+            msg = "No lyrics found for this song"
+        if msg:
+            p.setPen(fg2)
+            p.setFont(font(13.5, QFont.Medium))
+            p.drawText(body, Qt.AlignCenter, msg)
+        else:
+            lines = lyr.get("synced") or [(0, ln) for ln in lyr.get("plain", [])]
+            p.save()
+            p.setClipRect(body)
+            line_h = 30.0
+            cy = body.center().y()
+            first = max(0, int(self.lyr_scroll) - 4)
+            for i in range(first, min(len(lines), int(self.lyr_scroll) + 6)):
+                d = i - self.lyr_scroll
+                y = cy + d * line_h
+                if y < body.top() - line_h or y > body.bottom() + line_h:
+                    continue
+                text = lines[i][1] or "\u266a"
+                current = i == self.lyr_idx
+                k = max(0.0, 1.0 - abs(d))               # 1 at the centre line
+                size = 13.5 + 3.5 * k
+                self._lyric_font(p, text, size, QFont.DemiBold if current else QFont.Medium, body.width())
+                c = QColor(fg)
+                c.setAlphaF(max(0.16, 1.0 - abs(d) * 0.36) if not current else 1.0)
+                p.setPen(c)
+                p.drawText(QRectF(body.left(), y - line_h / 2, body.width(), line_h), Qt.AlignCenter,
+                           elide(p, text, body.width()))
+            if self.lyr_idx < 0 and "synced" in lyr:
+                p.setPen(fg2)
+                p.setFont(font(15, QFont.DemiBold))
+                p.drawText(QRectF(body.left(), cy - line_h * 1.5, body.width(), line_h), Qt.AlignCenter,
+                           "\u266a  \u266a  \u266a")
+            p.restore()
+        # footer: progress
+        pos = self.hub.media_position()
+        dur = self.hub.media_duration()
+        fy = r.bottom() - 30
+        if dur > 0 and pos is not None:
+            bar = QRectF(x0 + 42, fy + 6, x1 - x0 - 84, 4)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(fg.red(), fg.green(), fg.blue(), 45))
+            p.drawRoundedRect(bar, 2, 2)
+            p.setBrush(fg)
+            p.drawRoundedRect(QRectF(bar.left(), bar.top(), max(4.0, bar.width() * min(1.0, pos / dur)), 4), 2, 2)
+            p.setPen(fg2)
+            p.setFont(font(10.5, QFont.Medium))
+            p.drawText(QRectF(x0, fy, 38, 16), Qt.AlignLeft | Qt.AlignVCenter, _mmss(pos))
+            p.drawText(QRectF(x1 - 38, fy, 38, 16), Qt.AlignRight | Qt.AlignVCenter, "-" + _mmss(dur - pos))
+        foot = ""
+        if self.hover_zone:
+            foot = self.hover_label
+        elif "plain" in lyr:
+            foot = "Lyrics aren't time-synced  \u00b7  scroll to read"
+        p.setPen(fg2)
+        p.setFont(font(10.5))
+        p.drawText(QRectF(x0, fy + 12, x1 - x0, 16), Qt.AlignCenter, foot)
+
     def _run_shortcut(self, sid):
         if sid not in ("timer", "dnd", "dark_mode"):
             self.t_leave.stop()
             self.collapse()
         self.hub.do(sid)
         self.update()
+
+
+def _mmss(sec):
+    sec = max(0, int(sec))
+    return f"{sec // 60}:{sec % 60:02d}"
 
 
 class _DarkPalProxy:

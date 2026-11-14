@@ -320,14 +320,35 @@ class LinuxBackend(Backend):
         status = _run(["playerctl", "status"], 1).strip()
         if status not in ("Playing", "Paused"):
             return None
-        meta = _run(["playerctl", "metadata", "--format", "{{title}}\t{{artist}}\t{{playerName}}"], 1)
+        meta = _run(["playerctl", "metadata", "--format",
+                     "{{title}}\t{{artist}}\t{{playerName}}\t{{album}}\t{{mpris:length}}\t{{position}}"], 1)
         parts = meta.rstrip("\n").split("\t")
         if not parts or not parts[0]:
             return None
-        while len(parts) < 3:
+        while len(parts) < 6:
             parts.append("")
+
+        def us(v):
+            try:
+                return int(v) / 1e6
+            except ValueError:
+                return 0.0
+        player = parts[2].lower()
         return {"title": parts[0], "artist": parts[1], "source": parts[2].capitalize(),
-                "playing": status == "Playing", "app_id": "wm:" + parts[2].lower()}
+                "album": parts[3], "playing": status == "Playing", "app_id": "wm:" + player,
+                "video": player in ("chromium", "chrome", "firefox", "brave", "vivaldi", "opera"),
+                "duration": us(parts[4]), "position": us(parts[5])}
+
+    def open_media(self, media: dict, windows: list) -> bool:
+        if super().open_media(media, windows):
+            return True
+        player = (media.get("app_id") or "").replace("wm:", "")
+        if player and shutil.which("dbus-send"):     # MPRIS Raise: works for Spotify, VLC, browsers
+            _spawn(["dbus-send", "--session", "--type=method_call",
+                    f"--dest=org.mpris.MediaPlayer2.{player}", "/org/mpris/MediaPlayer2",
+                    "org.mpris.MediaPlayer2.Raise"])
+            return True
+        return False
 
     def media(self, cmd: str):
         if shutil.which("playerctl"):
