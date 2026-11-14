@@ -15,7 +15,8 @@ if IS_LINUX and os.environ.get("WAYLAND_DISPLAY") and not os.environ.get("QT_QPA
     # Wayland forbids apps from placing their own windows; XWayland allows it.
     os.environ["QT_QPA_PLATFORM"] = "xcb"
 
-from PyQt5.QtCore import QCoreApplication, Qt, QTimer  # noqa: E402
+from PyQt5.QtCore import QCoreApplication, QObject, Qt, QTimer, pyqtSignal  # noqa: E402
+from PyQt5.QtGui import QPixmapCache  # noqa: E402
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
 from PyQt5.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget  # noqa: E402
 
@@ -108,98 +109,9 @@ class WinHotkeys(QWidget):
         return False, 0
 
 
-class WinKeyHook:
-    """Tapping the Windows key alone opens Nocthify Apps instead of the Start menu.
-
-    A low-level keyboard hook watches only the two Windows keys.  Win+<anything>
-    combos (Win+E, Win+D, Win+L, ...) are left completely alone.  For a lone tap
-    the key-up is swallowed and replaced by "mask key + Win up", the same trick
-    AutoHotkey uses, so Windows never sees a bare Win press and Start stays shut.
-    """
-
-    MARK = 0x4E4F4354           # dwExtraInfo tag on events we inject ourselves ("NOCT")
-    VK_MASK = 0xE8              # unassigned virtual key
-
-    def __init__(self, callback):
-        import ctypes
-        import ctypes.wintypes as wt
-        self.ctypes = ctypes
-        self.callback = callback
-        self.user32 = ctypes.WinDLL("user32", use_last_error=True)
-        LRESULT = ctypes.c_ssize_t
-
-        class KBDLLHOOKSTRUCT(ctypes.Structure):
-            _fields_ = [("vkCode", wt.DWORD), ("scanCode", wt.DWORD), ("flags", wt.DWORD),
-                        ("time", wt.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
-
-        self.KB = KBDLLHOOKSTRUCT
-        self.HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wt.WPARAM, wt.LPARAM)
-        self.user32.SetWindowsHookExW.argtypes = [ctypes.c_int, self.HOOKPROC, wt.HINSTANCE, wt.DWORD]
-        self.user32.SetWindowsHookExW.restype = ctypes.c_void_p
-        self.user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wt.WPARAM, wt.LPARAM]
-        self.user32.CallNextHookEx.restype = LRESULT
-        self.user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
-        self.user32.keybd_event.argtypes = [wt.BYTE, wt.BYTE, wt.DWORD, ctypes.c_size_t]
-        ctypes.windll.kernel32.GetModuleHandleW.restype = wt.HMODULE
-        self._proc = self.HOOKPROC(self._hook)
-        self.hook = None
-        self.win_down = False
-        self.combo = False
-        # Windows silently drops a hook that ever answers too slowly; re-arm it now and then.
-        self._rearm = QTimer(interval=60000, timeout=self.reinstall)
-
-    def install(self):
-        if self.hook:
-            return True
-        mod = self.ctypes.windll.kernel32.GetModuleHandleW(None)
-        self.hook = self.user32.SetWindowsHookExW(13, self._proc, mod, 0)   # WH_KEYBOARD_LL
-        if not self.hook:
-            log.warning("Windows key hook failed (%s)", self.ctypes.get_last_error())
-            return False
-        self._rearm.start()
-        return True
-
-    def uninstall(self):
-        self._rearm.stop()
-        if self.hook:
-            self.user32.UnhookWindowsHookEx(self.hook)
-            self.hook = None
-
-    def reinstall(self):
-        if self.hook:
-            self.user32.UnhookWindowsHookEx(self.hook)
-            self.hook = None
-        self.install()
-
-    def _hook(self, code, wparam, lparam):
-        try:
-            if code == 0:
-                kb = self.KB.from_address(lparam)
-                if kb.dwExtraInfo != self.MARK:
-                    vk = kb.vkCode
-                    down = wparam in (0x100, 0x104)
-                    if vk in (0x5B, 0x5C):
-                        if down:
-                            if not self.win_down:
-                                self.win_down, self.combo = True, False
-                        else:
-                            lone = self.win_down and not self.combo
-                            self.win_down = False
-                            if lone:
-                                QTimer.singleShot(0, lambda v=vk: self._finish_tap(v))
-                                return 1          # swallow the key-up for now
-                    elif down and self.win_down:
-                        self.combo = True
-        except Exception:
-            pass
-        return self.user32.CallNextHookEx(None, code, wparam, lparam)
-
-    def _finish_tap(self, vk):
-        kd = self.user32.keybd_event
-        kd(self.VK_MASK, 0, 0, self.MARK)
-        kd(self.VK_MASK, 0, 2, self.MARK)
-        kd(vk, 0, 1 | 2, self.MARK)                       # extended key-up for the Win key
-        self.callback()
+class HookBridge(QObject):
+    """Carries events from the hook thread to the UI thread."""
+    event = pyqtSignal(str)
 
 
 class NocthifyApp:
@@ -213,7 +125,7 @@ class NocthifyApp:
         self.cc = None
         self.settings = None
         self.hotkeys = None
-        self.winkey = None
+        self.hooks = None
 
         h = self.hub.handlers
         h["launcher"] = self.toggle_launcher
@@ -227,7 +139,12 @@ class NocthifyApp:
         self.apply_taskbar_mode()
         self.dock = Dock(self.hub)
         self.hub.dock = self.dock
+        self.hub.busy_checks.append(lambda: self.dock.mouse is not None or
+                                    bool(self.dock._genie and self.dock._genie.isVisible()))
         self.island = Island(self.hub)
+        self.hub.busy_checks.append(lambda: self.island.inside or self.island.mode != "compact")
+        self._reap_launcher = QTimer(singleShot=True, timeout=self._drop_launcher)
+        self._start_hooks()
         self._tray()
         self._hotkeys()
         self._autostart()
@@ -260,17 +177,45 @@ class NocthifyApp:
         if self.hotkeys is None:
             self.hotkeys = WinHotkeys(self.hub.do)
         g = self.config.get("general")
-        if g.get("win_key_launcher", True):
-            if self.winkey is None:
-                self.winkey = WinKeyHook(lambda: self.hub.do("launcher"))
-            self.winkey.install()
-        elif self.winkey is not None:
-            self.winkey.uninstall()
+        if self.hooks is not None:
+            self.hooks.win_key = bool(g.get("win_key_launcher", True))
         failed = self.hotkeys.register({"launcher": g.get("hotkey_launcher", ""),
                                         "control_center": g.get("hotkey_control_center", "")})
         if failed:
             QTimer.singleShot(4200, lambda: self.hub.notify(
                 f"{failed[0]} is taken by another app. Change it in Settings", "keyboard", kind="system"))
+
+    def _start_hooks(self):
+        """Windows: let the OS tell us about window / taskbar / key changes (no busy polling)."""
+        if not IS_WIN:
+            return
+        try:
+            from .backends.win_hooks import HookThread
+        except Exception:
+            log.exception("hooks")
+            return
+        self._bridge = HookBridge()
+        self._bridge.event.connect(self._on_hook)
+        self.hooks = HookThread(self._bridge.event.emit)
+        self.hooks.win_key = bool(self.config.get("general", "win_key_launcher"))
+        self.hooks.start()
+        self.hooks.ready.wait(2.0)
+        self.hub.attach_hooks(self.hooks)
+
+    def _on_hook(self, kind):
+        if kind == "win_tap":
+            self.hub.do("launcher")
+        elif kind == "windows":
+            self.hub.windows_dirty()
+        elif kind == "names":
+            self.hub.names_dirty()
+        elif kind == "volume":
+            self.hub.poll_volume_soon()
+        elif kind == "media":
+            if self.hub.media_watcher is not None:
+                self.hub.media_watcher.poke()
+        elif kind == "taskbar":
+            self.backend.taskbar_watchdog()
 
     def _autostart(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -313,17 +258,32 @@ class NocthifyApp:
         self.island.update()
 
     def toggle_launcher(self):
+        self._reap_launcher.stop()
         if self.launcher is None:
             from .ui.launcher import Launcher
             self.launcher = Launcher(self.hub)
+            self.launcher.closed.connect(self._launcher_closed)
         if self.cc is not None and self.cc.isVisible():
             self.cc.hide()
         self.launcher.toggle()
+
+    def _launcher_closed(self):
+        self.hub.schedule_trim()
+        # the app grid holds ~100 icons: free it if Apps isn't reopened for a couple of minutes
+        if self.config.get("general", "low_memory"):
+            self._reap_launcher.start(120000)
+
+    def _drop_launcher(self):
+        if self.launcher is not None and not self.launcher.isVisible():
+            self.launcher.deleteLater()
+            self.launcher = None
+            self.hub.schedule_trim(1500)
 
     def toggle_cc(self):
         if self.cc is None:
             from .ui.control_center import ControlCenter
             self.cc = ControlCenter(self.hub)
+            self.cc.closed.connect(lambda: self.hub.schedule_trim())
         if self.launcher is not None and self.launcher.isVisible():
             self.launcher.hide()
         self.cc.toggle()
@@ -332,7 +292,14 @@ class NocthifyApp:
         if self.settings is None:
             from .ui.settings import SettingsWindow
             self.settings = SettingsWindow(self.hub, self)
+            # Settings is big and rarely open: destroy it on close instead of keeping it around
+            self.settings.setAttribute(Qt.WA_DeleteOnClose, True)
+            self.settings.destroyed.connect(self._settings_gone)
         self.settings.show_page(self.settings.side.currentRow() if self.settings.isVisible() else 0)
+
+    def _settings_gone(self, *_):
+        self.settings = None
+        self.hub.schedule_trim(1500)
 
     def show_all(self):
         self.config.set("island", "enabled", True, emit=False)
@@ -348,8 +315,8 @@ class NocthifyApp:
             return
         self._restored = True
         try:
-            if self.winkey is not None:
-                self.winkey.uninstall()
+            if self.hooks is not None:
+                self.hooks.stop()
             self.backend.restore_animation()
             self.backend.release_edge()
             if IS_WIN:
@@ -400,6 +367,7 @@ def main(argv=None):
     qapp = QApplication(argv)
     qapp.setApplicationName(APP_NAME)
     qapp.setQuitOnLastWindowClosed(False)
+    QPixmapCache.setCacheLimit(2048)        # KB; Qt's default 10 MB is far more than we need
     _setup_logging()
 
     cmd = next((COMMANDS[a] for a in argv[1:] if a in COMMANDS), "show")

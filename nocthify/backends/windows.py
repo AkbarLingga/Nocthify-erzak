@@ -1235,9 +1235,10 @@ class WindowsBackend(Backend):
         user32.SetForegroundWindow(main)
 
     def taskbar_watchdog(self):
-        """Called every 500 ms: cheap visibility check, heavier checks every ~3 s."""
+        """Safety net (every 3 s, and right away when the taskbar fires a 'shown' event):
+        cheap visibility check, heavier checks every other call."""
         self._wd_tick = getattr(self, "_wd_tick", 0) + 1
-        heavy = self._wd_tick % 6 == 0
+        heavy = self._wd_tick % 2 == 0
         main = None
         if self._taskbar_hidden and time.time() > self._peek_until:
             main = user32.FindWindowW("Shell_TrayWnd", None)
@@ -1316,6 +1317,17 @@ class WindowsBackend(Backend):
             shell32.SHAppBarMessage(1, ctypes.byref(self._appbar_data()))  # ABM_REMOVE
             self._appbar_registered = False
             self._appbar_rect = None
+
+    def trim_memory(self):
+        """Move pages we haven't touched lately out of our working set.  They stay in RAM
+        (standby list) and come back instantly if needed, but Task Manager shows only what
+        Nocthify is really using right now."""
+        try:
+            psapi = ctypes.windll.psapi
+            psapi.EmptyWorkingSet.argtypes = [wt.HANDLE]
+            psapi.EmptyWorkingSet(wt.HANDLE(-1))          # -1 = this process (pseudo handle)
+        except (OSError, AttributeError, ctypes.ArgumentError):
+            pass
 
     def set_autostart(self, enabled: bool, command: str):
         path = r"Software\Microsoft\Windows\CurrentVersion\Run"

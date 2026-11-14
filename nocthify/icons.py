@@ -132,7 +132,7 @@ def pixmap(name: str, color, size: int, width: float = 2.0, dpr: float | None = 
     renderer.render(p, QRectF(0, 0, real, real))
     p.end()
     pm.setDevicePixelRatio(dpr)
-    if len(_cache) > 600:
+    if len(_cache) > 200:
         _cache.clear()
     _cache[key] = pm
     return pm

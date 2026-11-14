@@ -86,15 +86,11 @@ class Hub(QObject):
         self.palette = None
         self._async_done.connect(lambda cb, res: cb(res) if cb else None)
         self._media_raw.connect(self._on_media_session)
-        self.media_watcher = None
-        if backend.name == "windows":
-            try:
-                from .backends.media_win import MediaWatcher
-                watcher = MediaWatcher(self._media_raw.emit)
-                if watcher.start():
-                    self.media_watcher = watcher
-            except Exception:
-                self.media_watcher = None
+        self.media_watcher = None        # started lazily: costs ~6 MB, only worth it once music plays
+        self._watcher_tried = False
+        self._t_trim = QTimer(self, singleShot=True, timeout=self._trim)
+        self._t_trim_idle = self._timer(30000, lambda: self.schedule_trim(0))
+        self.busy_checks = []             # callables -> True while UI is animating / hovered
         self.refresh_palette(emit=False)
 
         linux = backend.name == "linux"
@@ -110,6 +106,10 @@ class Hub(QObject):
         self._t_timer.timeout.connect(self._tick_timer)
         self._t_watchdog = self._timer(500 if backend.name == "windows" else 5000,
                                        backend.taskbar_watchdog)
+        self._t_fullscreen = self._timer(1500, self._check_fullscreen)
+        self._t_dirty = QTimer(self, singleShot=True, interval=120, timeout=self._poll_windows)
+        self._t_names = QTimer(self, singleShot=True, interval=2500, timeout=self._poll_windows)
+        self.hooks = None
         QTimer.singleShot(0, self._initial)
 
     def _timer(self, ms, fn):
@@ -119,6 +119,7 @@ class Hub(QObject):
         return t
 
     def _initial(self):
+        self.schedule_trim(8000)
         self._poll_windows()
         self.poll_network()
         self._poll_battery()
@@ -161,6 +162,11 @@ class Hub(QObject):
         except Exception:
             wins = []
         sig = tuple(w.key() for w in wins)
+        if self.hooks is not None:
+            self.hooks.known = {w.id for w in wins}
+            self.hooks.pending = False
+            self.hooks.names_pending = False
+            self._t_names.stop()
         if sig != self._win_sig:
             self._win_sig = sig
             self.windows = wins
@@ -168,6 +174,9 @@ class Hub(QObject):
             if not self._t_media:
                 self._media_title = self.backend.media_info(wins)
                 self._merge_media()
+        self._check_fullscreen()
+
+    def _check_fullscreen(self):
         if self.config.get("general", "hide_in_fullscreen"):
             try:
                 fs = self.backend.is_fullscreen_foreground()
@@ -203,7 +212,56 @@ class Hub(QObject):
         self._media_sys = info
         self._merge_media()
 
+    # ------------------------------------------------------- event-driven mode
+    def attach_hooks(self, hooks):
+        """Windows told us it will report changes: polls become slow safety nets."""
+        self.hooks = hooks
+        self._t_windows.setInterval(10000)
+        self._t_watchdog.setInterval(3000)
+        if self._t_volume:
+            self._t_volume.setInterval(2500 if hooks.keyboard_ok else 450)
+
+    def windows_dirty(self):
+        if not self._t_dirty.isActive():
+            self._t_dirty.start()
+
+    def names_dirty(self):
+        if not self._t_names.isActive() and not self._t_dirty.isActive():
+            self._t_names.start()
+
+    def poll_volume_soon(self):
+        QTimer.singleShot(40, self._poll_volume)
+        QTimer.singleShot(260, self._poll_volume)
+
+    def ensure_media_watcher(self):
+        """Start the Windows media-session reader (play/pause state, position for lyrics)."""
+        if self._watcher_tried or self.backend.name != "windows":
+            return
+        self._watcher_tried = True
+        try:
+            from .backends.media_win import MediaWatcher
+            watcher = MediaWatcher(self._media_raw.emit)
+            if watcher.start():
+                self.media_watcher = watcher
+        except Exception:
+            self.media_watcher = None
+
+    # ---------------------------------------------------------------- memory
+    def schedule_trim(self, delay_ms=3000):
+        if self.config.get("general", "low_memory"):
+            self._t_trim.start(delay_ms)
+
+    def _trim(self):
+        if any(check() for check in self.busy_checks):
+            self._t_trim.start(4000)          # don't trim mid-animation; try again shortly
+            return
+        import gc
+        gc.collect()
+        self.backend.trim_memory()
+
     def _merge_media(self):
+        if self._media_title and not self._watcher_tried:
+            self.ensure_media_watcher()
         sys_info = self._media_sys
         if not sys_info:
             self._set_media(self._media_title)

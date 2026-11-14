@@ -78,6 +78,8 @@ class Island(QWidget):
 
         self.anim = QVariantAnimation(self)
         self.anim.valueChanged.connect(self._on_shape)
+        self.anim.finished.connect(self._anim_done)
+        self._big = False
         self.t_hover = QTimer(self, singleShot=True, timeout=self.expand)
         self.t_leave = QTimer(self, singleShot=True, timeout=self.collapse)
         self.t_activity = QTimer(self, singleShot=True, timeout=self._end_activity)
@@ -132,10 +134,17 @@ class Island(QWidget):
         scr = QApplication.primaryScreen()
         # On Linux keep clear of top panels (GNOME top bar etc.)
         screen = scr.availableGeometry() if IS_LINUX else scr.geometry()
-        w = self.ew + 2 * M
-        h = self.top + max(self.eh, LH) + M
-        self.setFixedSize(w, h)
-        self.move(screen.x() + (screen.width() - w) // 2, screen.y())
+        # Two window sizes: a big one only while expanded / showing lyrics, and a small one
+        # for the pill.  A translucent window costs per pixel on every repaint, so the
+        # animated music bars are ~4x cheaper in the small window.
+        cx = screen.x() + screen.width() // 2
+        bw, bh = self.ew + 2 * M, self.top + max(self.eh, LH) + M
+        sw = min(bw, max(LYRIC_PILL, self.cw + 150, 340, self.cw + 46) + 2 * M)
+        sh = self.top + self.ch + 12 + M
+        self._geo_big = (cx - bw // 2, screen.y(), bw, bh)
+        self._geo_small = (cx - sw // 2, screen.y(), sw, sh)
+        self._big = None
+        self._resize_window(False)
         self.shape = self._target("compact")
         self.mode = "compact"
         self._apply_mask()
@@ -200,9 +209,12 @@ class Island(QWidget):
                 return
         prev = self.mode
         self.mode = mode
+        if mode in ("expanded", "lyrics"):
+            self._resize_window(True)
         target = self._target(mode)
         if not self.cfg.get("general", "animations"):
             self._on_shape(target)
+            self._anim_done()
             return
         self.anim.stop()
         self.anim.setStartValue(QRectF(self.shape))
@@ -223,6 +235,23 @@ class Island(QWidget):
             self._stats_on = want
             self.hub.want_stats(want)
 
+    def _resize_window(self, big):
+        if big == self._big:
+            return
+        old_w = self.width()
+        x, y, w, h = self._geo_big if big else self._geo_small
+        self._big = big
+        self.setFixedSize(w, h)
+        self.move(x, y)
+        if self.shape is not None and not self.shape.isNull():
+            self.shape.translate((w - old_w) / 2.0, 0)     # keep the pill where it is on screen
+        self._apply_mask()
+
+    def _anim_done(self):
+        if self.mode in ("compact", "activity") and self._big:
+            self._resize_window(False)
+            self.update()
+
     def _on_shape(self, rect):
         self.shape = QRectF(rect)
         self._apply_mask()
@@ -233,6 +262,7 @@ class Island(QWidget):
             self.setMask(QRegion(self.shape.adjusted(-2, -2, 2, 2).toAlignedRect()))
 
     def expand(self):
+        self.hub.ensure_media_watcher()       # so a paused song shows up in the card too
         target = "lyrics" if self.lyrics_on and self.hub.media else "expanded"
         if self.mode != target:
             self._go(target)

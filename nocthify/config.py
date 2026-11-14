@@ -44,6 +44,7 @@ DEFAULTS = {
         "glass_opacity": 0.62,      # 0.15 (very clear) .. 0.95 (almost solid)
         "real_blur": False,         # OS blur behind panels (Win10/11, KDE) - experimental
         "animations": True,
+        "low_memory": True,         # hand unused memory back to Windows/Linux while idle
         "hide_in_fullscreen": True,
         "autostart": True,
         "do_not_disturb": False,

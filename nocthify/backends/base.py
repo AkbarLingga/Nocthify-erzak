@@ -242,3 +242,11 @@ class Backend:
 
     def set_autostart(self, enabled: bool, command: str):
         pass
+
+    def trim_memory(self):
+        """Give freed heap memory back to the OS (Linux: glibc malloc_trim)."""
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except (OSError, AttributeError):
+            pass

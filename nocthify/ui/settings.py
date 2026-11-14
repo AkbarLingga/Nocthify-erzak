@@ -295,6 +295,8 @@ class SettingsWindow(QWidget):
         self._bool(cv, "general", "hide_in_fullscreen", "Hide in fullscreen apps",
                    "Games and videos stay clean")
         self._bool(cv, "general", "autostart", "Start with system")
+        self._bool(cv, "general", "low_memory", "Low memory mode",
+                   "Give unused memory back to the system while idle (~8 MB instead of ~30 MB)")
         self._bool(cv, "general", "clock_24h", "24-hour clock")
         if IS_WIN:
             self._choice(cv, "taskbar", "mode", "Windows taskbar",

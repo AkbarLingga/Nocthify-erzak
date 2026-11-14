@@ -892,20 +892,27 @@ class Dock(QWidget):
         if pm is not None and not pm.isNull():
             # QPainter's bilinear filter turns a 128 px icon drawn at 48 px soft and jaggy.
             # Pre-scale with Qt's area-averaging filter to the exact device size instead.
+            # Only two copies per icon: the resting size (drawn 1:1) and the fully magnified
+            # size, which is drawn slightly smaller in between (<1.6x: bilinear stays sharp).
             dpr = self.devicePixelRatioF() or 1.0
             px = max(1, int(round(r.width() * dpr)))
-            key = (it.kind, it.key or it.path, px)
+            base_px = max(1, int(round(self.base * dpr)))
+            which = "base" if px <= base_px else "mag"
+            size = base_px if which == "base" else max(px, int(round(self.mag * dpr)))
+            key = (it.kind, it.key or it.path, which)
             spm = self._scaled.get(key)
-            if spm is None:
-                if len(self._scaled) > 500:
-                    self._scaled.clear()
-                spm = pm if pm.width() == px else pm.scaled(px, px, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            if spm is None or spm.width() != size and spm.height() != size:
+                spm = pm if pm.width() == size else pm.scaled(size, size, Qt.KeepAspectRatio,
+                                                               Qt.SmoothTransformation)
                 spm.setDevicePixelRatio(dpr)
                 self._scaled[key] = spm
-            w, h = spm.width() / dpr, spm.height() / dpr
-            x = round((r.center().x() - w / 2) * dpr) / dpr
-            y = round((r.center().y() - h / 2) * dpr) / dpr
-            p.drawPixmap(QPointF(x, y), spm)
+            if spm.width() == px or spm.height() == px:
+                w, h = spm.width() / dpr, spm.height() / dpr
+                x = round((r.center().x() - w / 2) * dpr) / dpr
+                y = round((r.center().y() - h / 2) * dpr) / dpr
+                p.drawPixmap(QPointF(x, y), spm)
+            else:
+                p.drawPixmap(r, spm, QRectF(spm.rect()))
             return
         p.setPen(Qt.NoPen)
         g = QLinearGradient(r.topLeft(), r.bottomRight())
