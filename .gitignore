@@ -5,3 +5,6 @@ __pycache__/
 *.log
 .vscode/
 .idea/
+build/
+dist/
+release/

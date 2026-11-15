@@ -32,6 +32,22 @@ COMMANDS = {"--launcher": "launcher", "--control-center": "control_center", "--s
 
 log = logging.getLogger("nocthify")
 
+# True inside the PyInstaller build that NocthifySetup.exe installs
+FROZEN = bool(getattr(sys, "frozen", False))
+
+
+def _installed_autostart() -> bool:
+    """Does Windows already autostart an *installed* Nocthify (not this source folder)?"""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
+            value, _ = winreg.QueryValueEx(key, "Nocthify")
+    except OSError:
+        return False
+    value = str(value).lower()
+    return "nocthify.exe" in value and "run.pyw" not in value
+
 
 def _setup_logging():
     path = os.path.join(config_dir(), "nocthify.log")
@@ -235,6 +251,8 @@ class NocthifyApp:
 
     def _ensure_exe(self):
         """Keep Nocthify.exe (shows as "Nocthify" in Task Manager) built and up to date."""
+        if FROZEN:
+            return      # the installed build already is a real Nocthify.exe
         try:
             from .winexe import ensure_exe
             if ensure_exe():
@@ -243,6 +261,16 @@ class NocthifyApp:
             log.exception("Nocthify.exe")
 
     def _autostart(self):
+        if FROZEN:
+            # installed build (NocthifySetup.exe): the app *is* Nocthify.exe
+            cmd = f'"{sys.executable}"'
+            try:
+                self.backend.set_autostart(bool(self.config.get("general", "autostart")), cmd)
+            except Exception:
+                log.exception("autostart")
+            return
+        if IS_WIN and _installed_autostart():
+            return      # dev run from the source folder: never hijack the installed app's autostart
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         script = os.path.join(root, "run.pyw")
         exe = sys.executable
